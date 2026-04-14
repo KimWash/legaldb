@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Project output & temp
+output/
+temp/
+
+# Claude Code session files (random-named)
+[0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-]
+
+# Memory
+memory/
+
+# OS
+.DS_Store
+Thumbs.db

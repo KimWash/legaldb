@@ -1,0 +1,518 @@
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+from dataclasses import asdict
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from threading import BoundedSemaphore
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+from config_loader import ensure_directories, load_config, resolve_project_path
+from excel_writer import read_review_rows, write_review_workbook
+from extractor_docx import extract_docx
+from extractor_eml import extract_eml
+from extractor_image import extract_image
+from extractor_pdf import extract_pdf
+from extractor_pptx import extract_pptx
+from llm_client import OllamaClient
+from models import AnalysisRecord, ExtractionResult, NamingResult
+from naming_engine import infer_case_name, infer_doc_type, infer_institution, mark_conflicts, normalize_date, propose_name
+from rename_executor import execute_rename
+from rollback_executor import execute_rollback
+from scanner import scan_files
+
+SUMMARY_SIGNAL_PATTERN = re.compile(
+    r"(agreement|contract|notice|claim|arbitration|opinion|report|memo|"
+    r"계약|합의|소송|중재|의견|보고|통지|결의|증명|등기|양해각서|수정계약서)",
+    re.IGNORECASE,
+)
+CACHE_SCHEMA_VERSION = 4
+
+
+def _format_seconds(total_seconds: float) -> str:
+    secs = max(0, int(total_seconds))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _build_timing_suffix(start_ts: float, processed: int, total: int) -> str:
+    elapsed = max(0.0, time.monotonic() - start_ts)
+    if processed <= 0 or total <= 0:
+        return f"elapsed={_format_seconds(elapsed)} eta=--:--"
+    rate = processed / max(elapsed, 1e-6)
+    remaining = max(0, total - processed)
+    eta = remaining / max(rate, 1e-6)
+    return f"elapsed={_format_seconds(elapsed)} eta={_format_seconds(eta)}"
+
+
+def _is_clean_sentence(sentence: str) -> bool:
+    s = re.sub(r"\s+", " ", sentence or "").strip()
+    if len(s) < 12:
+        return False
+    if re.search(r"(dear|best regards|sincerely|from:|to:|subject:)", s, re.IGNORECASE):
+        return False
+    if re.search(r"[\|`~^_=]{2,}", s):
+        return False
+    token_count = len(re.findall(r"[A-Za-z가-힣0-9]+", s))
+    if token_count < 4:
+        return False
+    return True
+
+
+def _score_sentence(sentence: str) -> tuple[int, int, int]:
+    s = sentence
+    keyword_score = 3 if SUMMARY_SIGNAL_PATTERN.search(s) else 0
+    length_score = max(0, 45 - abs(len(s) - 34))
+    alpha_num_score = len(re.findall(r"[A-Za-z가-힣0-9]", s))
+    return (keyword_score, length_score, alpha_num_score)
+
+
+def _build_llm_excerpt(source_text: str, max_chars: int) -> str:
+    """Build an LLM-friendly excerpt that always front-loads the document beginning.
+
+    Legal documents concentrate the most identifying information (parties, subject,
+    legal action) in the first section. We reserve 60% of the budget for the
+    document head and fill the remaining 40% with high-scoring sentences from the
+    rest of the body.
+    """
+    text = re.sub(r"\s+", " ", source_text or "").strip()
+    if not text:
+        return ""
+
+    if len(text) <= max_chars:
+        return text
+
+    head_budget = max(400, int(max_chars * 0.6))
+    tail_budget = max_chars - head_budget
+
+    # Always include the document beginning.
+    head = text[:head_budget]
+
+    # Pick informative sentences from the remainder.
+    remainder = text[head_budget:]
+    candidates = re.split(r"(?<=[.!?。！？])\s+|\n+", remainder)
+    ranked: list[tuple[tuple[int, int, int], str]] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        s = re.sub(r"\s+", " ", raw).strip()
+        if not _is_clean_sentence(s):
+            continue
+        norm = re.sub(r"[^a-z0-9가-힣]+", "", s.lower())
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        ranked.append((_score_sentence(s), s))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    extra_parts: list[str] = []
+    used = 0
+    for _, sentence in ranked:
+        if used + len(sentence) + 1 > tail_budget:
+            continue
+        extra_parts.append(sentence)
+        used += len(sentence) + 1
+        if used >= tail_budget * 0.9:
+            break
+
+    if extra_parts:
+        return f"{head}\n...\n" + "\n".join(extra_parts)
+    return head
+
+
+def _cache_file_path(project_root: Path) -> Path:
+    return project_root / "temp" / "analysis_cache.json"
+
+
+def _load_cache(path: Path) -> dict:
+    if not path.exists():
+        return {"schema_version": CACHE_SCHEMA_VERSION, "entries": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"schema_version": CACHE_SCHEMA_VERSION, "entries": {}}
+        if int(data.get("schema_version", 0)) != CACHE_SCHEMA_VERSION:
+            return {"schema_version": CACHE_SCHEMA_VERSION, "entries": {}}
+        if not isinstance(data.get("entries"), dict):
+            data["entries"] = {}
+        return data
+    except Exception:
+        return {"schema_version": CACHE_SCHEMA_VERSION, "entries": {}}
+
+
+def _save_cache(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _build_cache_key(record, config: dict, perf: dict) -> str:
+    sig = {
+        "path": record.original_full_path,
+        "size": record.file_size,
+        "mtime": record.last_modified_time,
+        "llm_provider": config.get("llm", {}).get("provider", "ollama"),
+        "llm_model": config.get("llm", {}).get("openai", {}).get("model", ""),
+        "llm_primary_model": config.get("llm", {}).get("primary_model", ""),
+        "excerpt_chars": perf.get("llm_excerpt_chars", 0),
+        "extract_max_chars": perf.get("extract_max_chars", 0),
+        "ocr_enabled": bool(config.get("ocr", {}).get("enabled", True)),
+        "advanced_ocr_enabled": bool(config.get("ocr", {}).get("advanced", {}).get("enabled", True)),
+    }
+    raw = json.dumps(sig, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _should_call_llm(record, extraction: ExtractionResult, use_llm: bool) -> bool:
+    if not use_llm:
+        return False
+    if extraction.extraction_status != "success":
+        return False
+    if not extraction.text_excerpt:
+        return False
+    # Always call LLM when text is available — summary quality requires reading actual document body.
+    return True
+
+
+def _build_analysis_result(record, extraction: ExtractionResult, llm_result: dict | None, config: dict) -> AnalysisRecord:
+    naming = propose_name(record, extraction, llm_result, config)
+    if extraction.extraction_status == "manual_review_required":
+        naming.reason = "Legacy .doc requires manual review or external conversion."
+        naming.needs_manual_review = True
+        naming.confidence = 0.0
+    return AnalysisRecord(record, extraction, naming)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Legal DB local folder rename PoC")
+    parser.add_argument("--mode", required=True, choices=["analyze", "rename", "rollback"])
+    parser.add_argument("--config", default=str(CURRENT_DIR.parent / "config.yaml"))
+    parser.add_argument("--review-file")
+    parser.add_argument("--rollback-file")
+    parser.add_argument("--fast", action="store_true", help="Disable OCR and LLM for faster draft analysis")
+    parser.add_argument("--workers", type=int, help="Parallel workers for analyze mode")
+    parser.add_argument("--max-files", type=int, help="Process only first N scanned files")
+    parser.add_argument("--progress-every", type=int, default=10, help="Progress print interval")
+    parser.add_argument("--llm-excerpt-chars", type=int, help="Trim excerpt length sent to LLM")
+    parser.add_argument("--ocr-workers", type=int, help="Max concurrent OCR/PDF extraction workers")
+    parser.add_argument("--llm-workers", type=int, help="Max concurrent LLM calls")
+    parser.add_argument("--no-cache", action="store_true", help="Do not read/write analysis cache for this run")
+    parser.add_argument("--clear-cache", action="store_true", help="Delete analysis cache before analyze")
+    return parser.parse_args()
+
+
+def _performance_config(config: dict, args: argparse.Namespace) -> dict:
+    perf = config.get("performance", {})
+    cpu_count = os.cpu_count() or 4
+    default_workers = max(1, min(6, cpu_count))
+    default_ocr_workers = max(1, min(2, default_workers))
+    default_llm_workers = max(1, min(3, default_workers))
+    return {
+        "workers": max(1, int(args.workers or perf.get("workers", default_workers))),
+        "max_files": int(args.max_files or perf.get("max_files", 0)),
+        "progress_every": max(1, int(args.progress_every or perf.get("progress_every", 10))),
+        "extract_max_chars": int(perf.get("extract_max_chars", 8000)),
+        "llm_excerpt_chars": int(args.llm_excerpt_chars or perf.get("llm_excerpt_chars", 6000)),
+        "ocr_workers": max(1, int(args.ocr_workers or perf.get("ocr_workers", default_ocr_workers))),
+        "llm_workers": max(1, int(args.llm_workers or perf.get("llm_workers", default_llm_workers))),
+        "heartbeat_seconds": int(perf.get("heartbeat_seconds", 30)),
+        "fast": bool(args.fast),
+        "fast_disables_ocr": bool(perf.get("fast_disables_ocr", True)),
+        "fast_disables_llm": bool(perf.get("fast_disables_llm", True)),
+    }
+
+
+def _analyze_single_record(
+    record,
+    config: dict,
+    temp_dir: Path,
+    llm: OllamaClient | None,
+    use_llm: bool,
+    llm_excerpt_chars: int,
+    extract_max_chars: int,
+    cache_key: str,
+    ocr_semaphore: BoundedSemaphore,
+    llm_semaphore: BoundedSemaphore,
+) -> tuple[AnalysisRecord, str, dict]:
+    if not record.supported:
+        extraction = ExtractionResult(
+            file_type="unsupported",
+            extraction_status="skipped",
+            notes=["Unsupported extension or temporary Office file."],
+        )
+        naming = NamingResult(reason="Unsupported format skipped from rename candidates.", confidence=0.0, needs_manual_review=True, rename_status="unsupported", rollback_name=record.original_file_name)
+        analysis = AnalysisRecord(record, extraction, naming)
+        cache_payload = {"extraction": asdict(extraction), "llm_result": None}
+        return analysis, cache_key, cache_payload
+
+    path = Path(record.original_full_path)
+    if record.file_extension == ".pdf":
+        with ocr_semaphore:
+            extraction = extract_pdf(path, config, temp_dir, max_chars=extract_max_chars)
+    elif record.file_extension == ".docx":
+        extraction = extract_docx(path, max_chars=extract_max_chars)
+    elif record.file_extension == ".pptx":
+        extraction = extract_pptx(path, max_chars=extract_max_chars)
+    elif record.file_extension == ".ppt":
+        extraction = ExtractionResult(
+            file_type="ppt",
+            extraction_status="manual_review_required",
+            notes=["Legacy .ppt file requires external conversion or manual review."],
+        )
+    elif record.file_extension in (".jpg", ".jpeg", ".tif", ".tiff"):
+        with ocr_semaphore:
+            extraction = extract_image(path, config, max_chars=extract_max_chars)
+    elif record.file_extension == ".eml":
+        extraction = extract_eml(path, max_chars=extract_max_chars)
+    else:
+        extraction = ExtractionResult(
+            file_type="doc",
+            extraction_status="manual_review_required",
+            notes=["Legacy .doc file requires external conversion or manual review."],
+        )
+
+    llm_result = None
+    if llm is not None and _should_call_llm(record, extraction, use_llm):
+        source_text = extraction.extracted_text or extraction.text_excerpt
+        excerpt = _build_llm_excerpt(source_text, llm_excerpt_chars)
+        with llm_semaphore:
+            llm_result = llm.extract_metadata(
+                {
+                    "file_path": record.original_full_path,
+                    "file_extension": record.file_extension,
+                    "parent_folder": Path(record.original_dir_path).name,
+                    "relative_path": record.relative_path_from_root,
+                    "extracted_text_excerpt": excerpt,
+                }
+            )
+
+    analysis = _build_analysis_result(record, extraction, llm_result, config)
+    cache_payload = {"extraction": asdict(extraction), "llm_result": llm_result}
+    return analysis, cache_key, cache_payload
+
+
+def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
+    perf = _performance_config(config, args)
+    runtime_config = dict(config)
+    runtime_config["ocr"] = dict(config.get("ocr", {}))
+    runtime_config["llm"] = dict(config.get("llm", {}))
+    if perf["fast"] and perf["fast_disables_ocr"]:
+        runtime_config["ocr"]["enabled"] = False
+    if perf["fast"] and perf["fast_disables_llm"]:
+        runtime_config["llm"]["enabled"] = False
+
+    input_root = Path(config["input_root"])
+    temp_dir = resolve_project_path(project_root, config["temp"]["dir"])
+    tempfile.tempdir = str(temp_dir)
+    review_dir = resolve_project_path(project_root, config["review"]["output_dir"])
+    logs_dir = resolve_project_path(project_root, config["logs"]["output_dir"])
+    llm = OllamaClient(runtime_config, project_root) if runtime_config["llm"].get("enabled", True) else None
+    cache_path = _cache_file_path(project_root)
+    if args.clear_cache and cache_path.exists():
+        cache_path.unlink(missing_ok=True)
+    cache_enabled = not args.no_cache
+    cache_data = _load_cache(cache_path) if cache_enabled else {"schema_version": CACHE_SCHEMA_VERSION, "entries": {}}
+    cache_entries: dict = dict(cache_data.get("entries", {}))
+
+    scanned_records = scan_files(input_root, config)
+    if perf["max_files"] > 0:
+        scanned_records = scanned_records[: perf["max_files"]]
+
+    total_count = len(scanned_records)
+    analysis_records: list[AnalysisRecord] = []
+    uncached_records: list[tuple] = []
+    print(
+        f"[analyze] start total_files={total_count} workers={perf['workers']} "
+        f"fast={perf['fast']} ocr={runtime_config['ocr'].get('enabled', True)} "
+        f"llm={runtime_config['llm'].get('enabled', True)} "
+        f"ocr_workers={perf['ocr_workers']} llm_workers={perf['llm_workers']} "
+        f"cache_enabled={cache_enabled}"
+    )
+
+    processed_count = 0
+    manual_review_count = 0
+    cache_hit_count = 0
+    start_ts = time.monotonic()
+
+    for record in scanned_records:
+        cache_key = _build_cache_key(record, runtime_config, perf)
+        cached = cache_entries.get(cache_key) if cache_enabled else None
+        if isinstance(cached, dict) and isinstance(cached.get("extraction"), dict):
+            try:
+                extraction = ExtractionResult(**cached["extraction"])
+                llm_result = cached.get("llm_result")
+                result = _build_analysis_result(record, extraction, llm_result, runtime_config)
+                analysis_records.append(result)
+                processed_count += 1
+                cache_hit_count += 1
+                if result.naming.needs_manual_review:
+                    manual_review_count += 1
+                if (
+                    processed_count == 1
+                    or processed_count % perf["progress_every"] == 0
+                    or processed_count == total_count
+                ):
+                    progress = (processed_count / total_count * 100) if total_count else 100.0
+                    timing = _build_timing_suffix(start_ts, processed_count, total_count)
+                    print(
+                        f"[analyze] progress {processed_count}/{total_count} ({progress:.1f}%) "
+                        f"manual_review={manual_review_count} cache_hits={cache_hit_count} {timing}"
+                    )
+                continue
+            except Exception:
+                pass
+        uncached_records.append((record, cache_key))
+
+    ocr_semaphore = BoundedSemaphore(perf["ocr_workers"])
+    llm_semaphore = BoundedSemaphore(perf["llm_workers"])
+
+    with ThreadPoolExecutor(max_workers=perf["workers"]) as executor:
+        future_to_record = {
+            executor.submit(
+                _analyze_single_record,
+                record_and_key[0],
+                runtime_config,
+                temp_dir,
+                llm,
+                bool(runtime_config["llm"].get("enabled", True)),
+                perf["llm_excerpt_chars"],
+                perf["extract_max_chars"],
+                record_and_key[1],
+                ocr_semaphore,
+                llm_semaphore,
+            ): record_and_key[0]
+            for record_and_key in uncached_records
+        }
+
+        pending = set(future_to_record.keys())
+        last_heartbeat = time.monotonic()
+
+        while pending:
+            done, pending = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
+
+            if not done:
+                now = time.monotonic()
+                if now - last_heartbeat >= perf["heartbeat_seconds"]:
+                    timing = _build_timing_suffix(start_ts, processed_count, total_count)
+                    print(f"[analyze] heartbeat completed={processed_count}/{total_count} pending={len(pending)} {timing}")
+                    last_heartbeat = now
+                continue
+
+            for future in done:
+                record = future_to_record[future]
+                try:
+                    result, cache_key, cache_payload = future.result()
+                    if cache_enabled:
+                        cache_entries[cache_key] = cache_payload
+                except Exception as exc:
+                    extraction = ExtractionResult(
+                        file_type="error",
+                        extraction_status=f"worker_error:{exc}",
+                        notes=["Unhandled worker exception."],
+                    )
+                    naming = NamingResult(
+                        reason="Worker error occurred while analyzing this file.",
+                        confidence=0.0,
+                        needs_manual_review=True,
+                        rename_status="analysis_error",
+                        rollback_name=record.original_file_name,
+                    )
+                    result = AnalysisRecord(record, extraction, naming)
+
+                analysis_records.append(result)
+                processed_count += 1
+                if result.naming.needs_manual_review:
+                    manual_review_count += 1
+
+                if (
+                    processed_count == 1
+                    or processed_count % perf["progress_every"] == 0
+                    or processed_count == total_count
+                ):
+                    progress = (processed_count / total_count * 100) if total_count else 100.0
+                    timing = _build_timing_suffix(start_ts, processed_count, total_count)
+                    print(
+                        f"[analyze] progress {processed_count}/{total_count} ({progress:.1f}%) "
+                        f"manual_review={manual_review_count} cache_hits={cache_hit_count} {timing}"
+                    )
+
+    analysis_records.sort(key=lambda item: item.file_record.seq)
+    if cache_enabled:
+        _save_cache(cache_path, {"schema_version": CACHE_SCHEMA_VERSION, "entries": cache_entries})
+
+    mark_conflicts(analysis_records)
+    try:
+        workbook_path = write_review_workbook(analysis_records, review_dir)
+    except ModuleNotFoundError as exc:
+        raise SystemExit(f"Missing dependency for Excel output: {exc}. Run `pip install -r requirements.txt`.") from exc
+
+    summary = {
+        "input_root": str(input_root),
+        "total_files": len(analysis_records),
+        "supported_files": sum(1 for item in analysis_records if item.file_record.supported),
+        "manual_review_count": sum(1 for item in analysis_records if item.naming.needs_manual_review),
+        "cache_hits": cache_hit_count,
+        "review_workbook": str(workbook_path),
+    }
+    summary_path = logs_dir / f"analysis_summary_{workbook_path.stem.replace('rename_review_', '')}.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def rename_mode(config: dict, project_root: Path, review_file: str | None) -> int:
+    if not review_file:
+        raise SystemExit("--review-file is required for rename mode")
+
+    review_path = Path(review_file)
+    if not review_path.is_absolute():
+        review_path = (project_root / review_path).resolve()
+
+    try:
+        review_rows = read_review_rows(review_path)
+    except ModuleNotFoundError as exc:
+        raise SystemExit(f"Missing dependency for Excel input: {exc}. Run `pip install -r requirements.txt`.") from exc
+
+    result = execute_rename(
+        review_rows=review_rows,
+        config=config,
+        logs_dir=resolve_project_path(project_root, config["logs"]["output_dir"]),
+        rollback_dir=resolve_project_path(project_root, config["rollback"]["output_dir"]),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def rollback_mode(rollback_file: str | None) -> int:
+    if not rollback_file:
+        raise SystemExit("--rollback-file is required for rollback mode")
+    print(json.dumps(execute_rollback(Path(rollback_file)), ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    project_root = CURRENT_DIR.parent
+    config = load_config(args.config)
+    ensure_directories(config, project_root)
+
+    if args.mode == "analyze":
+        return analyze(config, project_root, args)
+    if args.mode == "rename":
+        return rename_mode(config, project_root, args.review_file)
+    return rollback_mode(args.rollback_file)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,70 @@
+input_root: "D:/work/2026_workspace/Legal_DB/법무DB(테스트)"
+scan_recursive: true
+supported_extensions:
+  - ".pdf"
+  - ".docx"
+  - ".doc"
+  - ".pptx"
+  - ".ppt"
+  - ".jpg"
+  - ".jpeg"
+  - ".tif"
+  - ".tiff"
+  - ".eml"
+exclude_extensions:
+  - ".xlsx"
+  - ".xls"
+  - ".png"
+  - ".html"
+llm:
+  provider: "openai"
+  enabled: true
+  endpoint: "http://127.0.0.1:11434/api/generate"
+  primary_model: "qwen3.5:latest"
+  secondary_model: "qwen3-vl:8b"
+  context_length: 16384
+  temperature: 0.1
+  timeout_seconds: 90
+  openai:
+    model: "gpt-4.1-mini"
+    base_url: "https://api.openai.com/v1"
+    api_key: ""
+ocr:
+  enabled: true
+  language: "kor+eng"
+  skip_text: true
+  force_ocr_threshold_chars: 80
+  timeout_seconds: 180
+  advanced:
+    enabled: true
+    dpi: 400
+    language: "kor+eng"
+    min_len: 40
+    fallback_to_ocrmypdf: true
+    tesseract_cmd: "C:/Program Files/Tesseract-OCR/tesseract.exe"
+review:
+  output_dir: "./output/review"
+logs:
+  output_dir: "./output/logs"
+rollback:
+  output_dir: "./output/rollback"
+temp:
+  dir: "./temp"
+naming:
+  org_name: "법무실"
+  confidence_threshold: 0.78
+  max_filename_length: 180
+rename:
+  execute_only_if_approved: true
+  keep_folder_structure: true
+  create_rollback_map: true
+  path_length_limit: 240
+performance:
+  workers: 4
+  progress_every: 10
+  heartbeat_seconds: 30
+  max_files: 0
+  extract_max_chars: 15000
+  llm_excerpt_chars: 5000
+  fast_disables_ocr: true
+  fast_disables_llm: true

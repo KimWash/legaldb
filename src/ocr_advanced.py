@@ -6,6 +6,8 @@ import hashlib
 import json
 import statistics
 import subprocess
+import time
+from typing import Iterator
 
 
 @dataclass
@@ -38,21 +40,26 @@ def _ensure_dirs(base: Path) -> dict[str, Path]:
     return {"base": base, "rendered": rendered, "processed": processed, "page_txt": page_txt}
 
 
-def _render_pdf_pages(pdf_path: Path, dpi: int):
+def _get_pdf_page_count(pdf_path: Path) -> int:
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(str(pdf_path))
+    return len(doc)
+
+
+def _iter_pdf_pages(pdf_path: Path, dpi: int) -> Iterator[tuple[int, object]]:
+    """Lazily yield (page_no, bgr_image) one page at a time to avoid loading all pages into memory."""
     import pypdfium2 as pdfium
     import cv2
     import numpy as np
 
     scale = dpi / 72.0
     doc = pdfium.PdfDocument(str(pdf_path))
-    output = []
     for page_index in range(len(doc)):
         page = doc[page_index]
         pil_img = page.render(scale=scale).to_pil().convert("RGB")
         rgb = np.array(pil_img)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        output.append((page_index + 1, bgr))
-    return output
+        yield (page_index + 1, bgr)
 
 
 def _preprocess_image(image):
@@ -151,7 +158,7 @@ def _resolve_tesseract_cmd(config: dict) -> str:
     return "tesseract"
 
 
-def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict) -> AdvancedOcrResult:
+def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_seconds: int = 0) -> AdvancedOcrResult:
     import cv2
     import pytesseract
 
@@ -178,13 +185,18 @@ def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict) -> AdvancedOc
     min_len = int(config.get("min_len", 40))
     save_debug_images = bool(config.get("save_debug_images", False))
 
-    page_images = _render_pdf_pages(pdf_path, dpi=dpi)
+    total_pages = _get_pdf_page_count(pdf_path)
     page_results: list[AdvancedPageResult] = []
     failed_pages: list[int] = []
     merged_parts: list[str] = []
     all_conf: list[float] = []
+    timed_out = False
+    start_time = time.monotonic()
 
-    for page_no, image in page_images:
+    for page_no, image in _iter_pdf_pages(pdf_path, dpi=dpi):
+        if timeout_seconds > 0 and time.monotonic() - start_time > timeout_seconds:
+            timed_out = True
+            break
         preprocessed = _preprocess_image(image)
         if save_debug_images:
             cv2.imwrite(str(dirs["rendered"] / f"page_{page_no:04d}.png"), image)
@@ -222,12 +234,23 @@ def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict) -> AdvancedOc
     merged_path = dirs["base"] / "merged.txt"
     merged_path.write_text(merged_text, encoding="utf-8")
 
+    processed_pages = len(page_results)
+    mean_conf = round(statistics.mean(all_conf), 3) if all_conf else 0.0
+    if timed_out:
+        elapsed = round(time.monotonic() - start_time, 1)
+        final_status = "timeout_partial" if merged_text != "__NO_TEXT__" else "timeout_no_text"
+    else:
+        final_status = "success" if merged_text != "__NO_TEXT__" else "no_text"
+
     summary = {
         "pdf_path": str(pdf_path),
-        "total_pages": len(page_images),
+        "total_pages": total_pages,
+        "processed_pages": processed_pages,
+        "timed_out": timed_out,
+        "timeout_seconds": timeout_seconds,
         "success_pages": sum(1 for item in page_results if item.status == "success"),
         "failed_pages": failed_pages,
-        "mean_confidence": round(statistics.mean(all_conf), 3) if all_conf else 0.0,
+        "mean_confidence": mean_conf,
         "settings": {
             "dpi": dpi,
             "lang": lang,
@@ -244,9 +267,9 @@ def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict) -> AdvancedOc
 
     return AdvancedOcrResult(
         text=merged_text if merged_text != "__NO_TEXT__" else "",
-        mean_confidence=summary["mean_confidence"],
+        mean_confidence=mean_conf,
         failed_pages=failed_pages,
-        total_pages=len(page_images),
+        total_pages=total_pages,
         run_dir=run_dir,
-        status="success" if merged_text != "__NO_TEXT__" else "no_text",
+        status=final_status,
     )

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+from typing import TYPE_CHECKING
 import csv
 import json
+
+if TYPE_CHECKING:
+    from sharepoint_client import SharePointClient
 
 
 INVALID_CHARS = set('\\/:*?"<>|')
@@ -13,7 +17,14 @@ def _is_valid_filename(name: str) -> bool:
     return bool(name) and not any(char in INVALID_CHARS for char in name)
 
 
-def execute_rename(review_rows: list[dict], config: dict, logs_dir: Path, rollback_dir: Path) -> dict:
+def execute_rename(
+    review_rows: list[dict],
+    config: dict,
+    logs_dir: Path,
+    rollback_dir: Path,
+    sp_client: "SharePointClient | None" = None,
+    site_url: str = "",
+) -> dict:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     jsonl_path = logs_dir / f"rename_log_{timestamp}.jsonl"
     csv_path = logs_dir / f"rename_result_{timestamp}.csv"
@@ -23,51 +34,86 @@ def execute_rename(review_rows: list[dict], config: dict, logs_dir: Path, rollba
     rollback_items: list[dict] = []
     path_limit = int(config["rename"].get("path_length_limit", 240))
 
+    # SharePoint 파일인데 --source sharepoint 없이 실행하는 케이스 조기 감지
+    approved_rows = [r for r in review_rows if str(r.get("approval") or "").strip().upper() == "Y"]
+    if sp_client is None and approved_rows:
+        first_sp_id = str(approved_rows[0].get("sharepoint_item_id") or "").strip()
+        if first_sp_id:
+            raise SystemExit(
+                "[rename] SharePoint 파일이 감지되었으나 --source sharepoint 옵션이 없습니다.\n"
+                "  올바른 명령: python src/main.py --mode rename --source sharepoint --review-file <파일>"
+            )
+
     for row in review_rows:
         approval = str(row.get("approval") or "").strip().upper()
         if approval != "Y":
             continue
 
+        sp_item_id = str(row.get("sharepoint_item_id") or "").strip()
         original_path = Path(str(row.get("original_full_path") or ""))
         target_path = Path(str(row.get("suggested_full_path") or ""))
+        new_name = target_path.name
         status = "pending"
         reason = ""
 
-        if not original_path.exists():
-            status = "source_missing"
-            reason = "원본 파일이 존재하지 않습니다."
-        elif not _is_valid_filename(target_path.name):
+        if not _is_valid_filename(new_name):
             status = "invalid_filename"
             reason = "금지 문자가 포함된 파일명입니다."
-        elif len(str(target_path)) > path_limit:
-            status = "path_too_long"
-            reason = "경로 길이 제한을 초과합니다."
-        elif target_path.exists() and original_path.resolve() != target_path.resolve():
-            status = "target_exists"
-            reason = "동일한 대상 파일명이 이미 존재합니다."
-        else:
+        elif sp_item_id and sp_client is not None:
+            # SharePoint rename via Graph API
             try:
-                original_path.rename(target_path)
+                sp_client.rename_item(sp_item_id, new_name)
                 status = "success"
-                reason = "파일명 변경 완료"
+                reason = "파일명 변경 완료 (SharePoint)"
                 rollback_items.append(
                     {
                         "timestamp": datetime.now().isoformat(timespec="seconds"),
                         "original_full_path": str(original_path),
                         "new_full_path": str(target_path),
                         "original_file_name": original_path.name,
-                        "new_file_name": target_path.name,
+                        "new_file_name": new_name,
+                        "sharepoint_item_id": sp_item_id,
                     }
                 )
             except Exception as exc:
                 status = "rename_failed"
                 reason = str(exc)
+        else:
+            # Local filesystem rename
+            if not original_path.exists():
+                status = "source_missing"
+                reason = "원본 파일이 존재하지 않습니다."
+            elif len(str(target_path)) > path_limit:
+                status = "path_too_long"
+                reason = "경로 길이 제한을 초과합니다."
+            elif target_path.exists() and original_path.resolve() != target_path.resolve():
+                status = "target_exists"
+                reason = "동일한 대상 파일명이 이미 존재합니다."
+            else:
+                try:
+                    original_path.rename(target_path)
+                    status = "success"
+                    reason = "파일명 변경 완료"
+                    rollback_items.append(
+                        {
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "original_full_path": str(original_path),
+                            "new_full_path": str(target_path),
+                            "original_file_name": original_path.name,
+                            "new_file_name": target_path.name,
+                            "sharepoint_item_id": "",
+                        }
+                    )
+                except Exception as exc:
+                    status = "rename_failed"
+                    reason = str(exc)
 
         results.append(
             {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "original_full_path": str(original_path),
                 "new_full_path": str(target_path),
+                "sharepoint_item_id": sp_item_id,
                 "status": status,
                 "reason": reason,
             }
@@ -78,17 +124,28 @@ def execute_rename(review_rows: list[dict], config: dict, logs_dir: Path, rollba
             file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     with csv_path.open("w", encoding="utf-8-sig", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=["timestamp", "original_full_path", "new_full_path", "status", "reason"])
+        writer = csv.DictWriter(
+            file,
+            fieldnames=["timestamp", "original_full_path", "new_full_path", "sharepoint_item_id", "status", "reason"],
+        )
         writer.writeheader()
         writer.writerows(results)
 
-    with rollback_path.open("w", encoding="utf-8") as file:
-        json.dump(rollback_items, file, ensure_ascii=False, indent=2)
+    if rollback_items:
+        rollback_envelope = {"site_url": site_url, "items": rollback_items}
+        with rollback_path.open("w", encoding="utf-8") as file:
+            json.dump(rollback_envelope, file, ensure_ascii=False, indent=2)
+    else:
+        rollback_path = None
 
     return {
         "log_jsonl": str(jsonl_path),
         "result_csv": str(csv_path),
-        "rollback_file": str(rollback_path),
+        "rollback_file": str(rollback_path) if rollback_path else None,
         "processed_count": len(results),
         "success_count": sum(1 for item in results if item["status"] == "success"),
+        "file_results": [
+            {"original_full_path": r["original_full_path"], "status": r["status"]}
+            for r in results
+        ],
     }

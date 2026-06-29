@@ -11,12 +11,15 @@ from models import AnalysisRecord, ExtractionResult, FileRecord, NamingResult, b
 DATE_PATTERNS_WITH_DAY = [
     # YYYY.MM.DD / YYYY-MM-DD / YYYY년 M월 D일
     re.compile(r"(20\d{2}|19\d{2})[.\-/년\s]+(0?[1-9]|1[0-2])[.\-/월\s]+(0?[1-9]|[12]\d|3[01])"),
-    # YYYYMMDD
+    # YYYYMMDD (8자리)
     re.compile(r"(20\d{2}|19\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"),
-    # YY.MM.DD / YY-MM-DD / YY/MM/DD
+    # YY.MM.DD / YY-MM-DD / YY/MM/DD (구분자 있음)
     re.compile(r"\b(\d{2})[.\-/\s]+(0?[1-9]|1[0-2])[.\-/\s]+(0?[1-9]|[12]\d|3[01])\b"),
     # DD.MM.YYYY / DD-MM-YYYY (day-first)
     re.compile(r"\b(0?[1-9]|[12]\d|3[01])[.\-/\s]+(0?[1-9]|1[0-2])[.\-/\s]+(20\d{2}|19\d{2})\b"),
+    # YYMMDD (6자리, 구분자 없음) — 반드시 YYYYMM 패턴보다 먼저 시도해야
+    # 200303 → yy=20(2020), mm=03, dd=03.  YYYYMMDD(8자리)와 구분: (?!\d)로 뒤 자리 없음 보장
+    re.compile(r"(?<!\d)(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"),
 ]
 DATE_PATTERNS_YEAR_MONTH = [
     # Examples: 1993.4월 / 1993-04 / 1993년 4월
@@ -27,7 +30,10 @@ DATE_PATTERNS_YEAR_MONTH = [
     re.compile(r"\b(\d{2})[.\-/\s]+(0?[1-9]|1[0-2])\b"),
 ]
 DOC_TYPE_KEYWORDS = [
-    "주주간계약서", "계약서", "소장", "답변서", "준비서면", "의견서", "보고서", "안내문", "안내", "중재신청서",
+    # 새 8분류 (LLM이 반환하는 값과 일치)
+    "소송진행보고", "심리결과보고", "법원명령", "상대방서면", "증거서류", "법률의견", "계약서", "통지서",
+    # 기존 세부 유형 (fallback infer_doc_type용)
+    "주주간계약서", "소장", "답변서", "준비서면", "의견서", "보고서", "안내문", "안내", "중재신청서",
     "중재판정문", "Partial Award", "Request for Arbitration", "Power of Attorney",
     "Retainer Agreement", "Settlement Agreement", "Statement of Claim", "witness statement",
     "Legal Notice", "Demand Letter", "Invoice", "Memo", "위임장", "품의서", "레터",
@@ -64,11 +70,19 @@ LOW_VALUE_KEYWORDS = {
     "however", "dear", "reference", "hereinafter", "thereof", "therein",
     "subject", "information", "update", "telephone", "number", "regards",
 }
+# Company/person/project proper nouns — already captured in case_name or institution fields
+COMPANY_PROPER_NOUNS = {
+    "daewoo", "dwa", "posco", "sunrise", "nam", "pillsbury",
+    "gabbay", "kwanika", "mcc", "rusconi", "dhaheri",
+    "international", "corporation", "company", "limited", "llc", "ltd",
+    "inc", "corp",
+}
 KEYWORD_NOISE_PATTERNS = [
     re.compile(r"^page\s*\d+$", re.IGNORECASE),
     re.compile(r"^dear\s+(mr|ms)\.?$", re.IGNORECASE),
     re.compile(r"^however$", re.IGNORECASE),
     re.compile(r"^comm$", re.IGNORECASE),
+    re.compile(r"^com$", re.IGNORECASE),
     re.compile(r"^reference\s*no\.?$", re.IGNORECASE),
     re.compile(r"^subject(\s+matter)?$", re.IGNORECASE),
 ]
@@ -78,8 +92,17 @@ KEYWORD_POSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOC_TYPE_TITLE_MAP = {
+    # 새 8분류 — LLM이 반환하는 값 그대로 문서명으로 사용
+    "소송진행보고": "소송진행보고",
+    "심리결과보고": "심리결과보고",
+    "법원명령": "법원명령",
+    "상대방서면": "상대방서면",
+    "증거서류": "증거서류",
+    "법률의견": "법률의견",
+    "통지서": "통지서",
+    # 기존 세부 유형 (infer_doc_type fallback 결과 대응)
+    "계약서": "계약서",
     "주주간계약서": "주주계약",
-    "계약서": "계약",
     "소장": "소장",
     "답변서": "답변서",
     "준비서면": "준비서면",
@@ -106,6 +129,11 @@ def sanitize_filename_component(value: str) -> str:
     value = re.sub(r'[\\/:*?"<>|]+', " ", value or "")
     value = re.sub(r"\s+", " ", value).strip()
     return value.strip("._")
+
+
+def strip_folder_status_tag(name: str) -> str:
+    """폴더명 앞의 [검토수행], [검토종결] 등 괄호 태그를 제거한다."""
+    return re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", name or "").strip()
 
 
 def _is_boilerplate_sentence(sentence: str) -> bool:
@@ -204,9 +232,11 @@ def _is_useful_keyword(keyword: str) -> bool:
     lower = k.lower()
     if lower in LOW_VALUE_KEYWORDS:
         return False
+    if lower in COMPANY_PROPER_NOUNS:
+        return False
     if re.search(r"\b(?:%s)\b" % "|".join(re.escape(x) for x in LOW_VALUE_KEYWORDS), lower):
         return False
-    if len(re.findall(r"[A-Za-z]", k)) >= 4 and not re.search(r"(agreement|contract|claim|notice|arbitration|opinion)", lower):
+    if len(re.findall(r"[A-Za-z]", k)) >= 4 and not re.search(r"(agreement|contract|claim|notice|arbitration|opinion|certificate|payment|litigation|counsel|hearing|dissolution|indemnity|guarantee|standstill|attachment|consolidation)", lower):
         return False
     return True
 
@@ -222,12 +252,21 @@ def _normalize_keyword_token(token: str) -> str:
     lower = t.lower()
     if lower in LOW_VALUE_KEYWORDS:
         return ""
+    if lower in COMPANY_PROPER_NOUNS:
+        return ""
+    # 구문 내 개별 단어 중 하나라도 회사/고유명사 차단 목록이면 제거
+    words = re.findall(r"[A-Za-z]+", lower)
+    if words and all(w in COMPANY_PROPER_NOUNS for w in words):
+        return ""
     for pattern in KEYWORD_NOISE_PATTERNS:
         if pattern.search(t):
             return ""
     # Remove tokens that are mostly digits/symbols.
     alpha = len(re.findall(r"[A-Za-z]", t))
     if alpha < 3:
+        return ""
+    # Reject sentence fragments (more than 6 words = not a keyword)
+    if len(t.split()) > 6:
         return ""
     return t
 
@@ -419,15 +458,33 @@ def _mapped_doc_title(doc_type: str) -> str:
     return ""
 
 
+def _title_from_summary_text(summary: str, max_chars: int = 10) -> str:
+    """단어 경계를 지키면서 max_chars 이내의 제목을 생성한다."""
+    cleaned = re.sub(r"[^A-Za-z가-힣\s]", "", summary or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    result = ""
+    for word in words:
+        candidate = result + word
+        if len(candidate) <= max_chars:
+            result = candidate
+        else:
+            break
+    if not result:
+        result = words[0][:max_chars]
+    return result
+
+
 def _document_title_from_summary(summary: str, doc_type: str) -> str:
     mapped = _mapped_doc_title(doc_type)
     if mapped:
         return mapped
     if summary:
-        core = re.sub(r"\s+", "", summary)
-        core = re.sub(r"[^A-Za-z가-힣0-9]", "", core)
-        if core:
-            return _normalize_document_title(core, max_chars=10)
+        title = _title_from_summary_text(summary, max_chars=10)
+        if title:
+            return title
     return "문서"
 
 
@@ -437,12 +494,56 @@ def _normalize_two_digit_year(two_digit_year: str) -> int:
     return 2000 + year if year <= 39 else 1900 + year
 
 
+def _yymmdd_to_year(yymmdd: str) -> int | None:
+    """YYMMDD 6자리 문자열에서 4자리 연도를 반환한다."""
+    m = re.match(r"^(\d{2})\d{4}$", (yymmdd or "").strip())
+    if not m:
+        return None
+    return _normalize_two_digit_year(m.group(1))
+
+
 def _format_yymmdd(year: int, month: int, day: int) -> str:
     try:
         validated = datetime(year, month, day)
         return validated.strftime("%y%m%d")
     except ValueError:
         return ""
+
+
+def _normalize_llm_date(raw: str) -> str:
+    """LLM이 반환한 날짜 문자열을 항상 YYMMDD 6자리로 정규화한다.
+
+    LLM이 규칙을 어기고 YYYYMMDD(8자리)나 YYYY-MM-DD 형식을 반환하는 경우를 처리.
+    """
+    s = re.sub(r"[.\-/년월일\s]", "", (raw or "").strip())
+    if not s or s.lower() == "date_unknown":
+        return "date_unknown"
+    # YYYYMMDD (8자리) → YYMMDD
+    m = re.match(r"^((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$", s)
+    if m:
+        result = _format_yymmdd(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if result:
+            return result
+    # YYYYMM (6자리, 19/20 시작) → YYMMday=1
+    m = re.match(r"^((?:19|20)\d{2})(0[1-9]|1[0-2])$", s)
+    if m:
+        result = _format_yymmdd(int(m.group(1)), int(m.group(2)), 1)
+        if result:
+            return result
+    # 이미 YYMMDD (6자리, 19/20 미시작)
+    m = re.match(r"^(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$", s)
+    if m:
+        result = _format_yymmdd(_normalize_two_digit_year(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if result:
+            return result
+    # YYMM (4자리) → day=1
+    m = re.match(r"^(\d{2})(0[1-9]|1[0-2])$", s)
+    if m:
+        result = _format_yymmdd(_normalize_two_digit_year(m.group(1)), int(m.group(2)), 1)
+        if result:
+            return result
+    # 그 외 형식은 normalize_date에 위임
+    return normalize_date(raw)
 
 
 def normalize_date(text: str) -> str:
@@ -464,6 +565,11 @@ def normalize_date(text: str) -> str:
         elif idx == 3:  # DD.MM.YYYY
             day, month, year = match.groups()
             result = _format_yymmdd(int(year), int(month), int(day))
+            if result:
+                return result
+        elif idx == 4:  # YYMMDD (6자리, 구분자 없음)
+            yy, month, day = match.groups()
+            result = _format_yymmdd(_normalize_two_digit_year(yy), int(month), int(day))
             if result:
                 return result
 
@@ -501,9 +607,21 @@ def infer_institution(text: str, fallback_name: str) -> str:
 
 
 def infer_case_name(file_record: FileRecord) -> str:
-    excluded = {"1. 계약서", "2. 보고서", "3. 검토의견", "4. 기타자료", "4. 기타문서", "5. 이메일", "5. 소송보고서", "1. 사건기록", "2. 증거자료", "3. 법률의견서"}
-    candidates = [part for part in Path(file_record.relative_path_from_root).parts[:-1] if part not in excluded]
-    return sanitize_filename_component(candidates[-1]) if candidates else ""
+    """사건명/프로젝트명은 항상 폴더 트리의 3번째 레벨에서 가져온다.
+
+    relative_path_from_root 기준 (root_folder 제외 후):
+      parts[0] = 대분류 (예: 소송 및 중재)
+      parts[1] = 사건명  (예: 두바이 Sunrise 소송)  ← 여기서 가져옴
+      parts[2] = 소분류 (예: 1. 사건기록)
+      ...
+    depth가 부족하면 가장 가까운 상위 폴더를 사용한다.
+    """
+    folder_parts = [p for p in Path(file_record.relative_path_from_root).parts[:-1]]
+    if len(folder_parts) >= 2:
+        return sanitize_filename_component(strip_folder_status_tag(folder_parts[1]))
+    if len(folder_parts) == 1:
+        return sanitize_filename_component(strip_folder_status_tag(folder_parts[0]))
+    return ""
 
 
 def infer_keyword(text: str, file_record: FileRecord) -> str:
@@ -546,53 +664,98 @@ def _keyword_supported_by_text(keyword: str, text: str) -> bool:
 
 
 def build_filename(org_name: str, document_title: str, case_name: str, institution: str, document_date: str, english_keyword: str, extension: str) -> str:
+    # 패턴: 법무실_사건명_문서명_[키워드_]날짜
+    # 사건명(case_name)은 항상 2번째 자리 고정 (institution으로 대체하지 않음)
     parts = [org_name]
-    # Avoid duplicating org_name when institution or case_name is identical to it.
-    if institution and institution != org_name:
-        parts.append(institution)
-    elif case_name and case_name != org_name:
+    if case_name and case_name != org_name:
         parts.append(case_name)
     parts.append(document_title or "문서")
-    if english_keyword and case_name:
+    if english_keyword:
         parts.append(english_keyword)
     parts.append(document_date or "date_unknown")
     cleaned = [sanitize_filename_component(part) for part in parts if sanitize_filename_component(part)]
     return "_".join(cleaned) + extension
 
 
-def evaluate_manual_review(extraction: ExtractionResult, result: NamingResult, threshold: float) -> bool:
+def _extraction_status_label(status: str) -> str:
+    if status in ("empty_text", "ocr_empty_text"):
+        return "텍스트 추출 결과 없음"
+    if status.startswith("missing_dependency"):
+        return "필수 라이브러리 미설치"
+    if status == "insufficient_text_no_ocr":
+        return "텍스트 부족 (OCR 미실행)"
+    if status == "manual_review_required":
+        return "수동 검토 필요 형식"
+    if status.startswith(("error:", "worker_error:")):
+        return "추출 오류"
+    if status.startswith("advanced_ocr:"):
+        return "OCR 처리 실패"
+    return f"추출 실패 ({status})"
+
+
+def evaluate_manual_review(extraction: ExtractionResult, result: NamingResult, threshold: float) -> tuple[bool, str]:
     if extraction.extraction_status != "success":
-        return True
+        return True, _extraction_status_label(extraction.extraction_status)
     if extraction.ocr_quality_low:
-        return True
+        return True, "OCR 품질 낮음"
     if not result.extracted_doc_type:
-        return True
+        return True, "문서 유형 미확인"
     if not result.extracted_document_title:
-        return True
+        return True, "문서 제목 미확인"
     if result.extracted_date == "date_unknown":
-        return True
+        return True, "날짜 미확인"
     if result.confidence < threshold:
-        return True
+        return True, f"신뢰도 미달 ({round(result.confidence * 100)}% < {round(threshold * 100)}%)"
     if result.conflict_detected:
-        return True
-    return False
+        return True, "파일명 중복"
+    return False, ""
 
 
-def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_result: dict | None, config: dict) -> NamingResult:
+def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_result: dict | None, config: dict, llm_client=None) -> NamingResult:
     threshold = float(config["naming"].get("confidence_threshold", 0.85))
     max_filename_length = int(config["naming"].get("max_filename_length", 180))
 
     doc_type = sanitize_filename_component(str((llm_result or {}).get("doc_type") or infer_doc_type(extraction.text_excerpt, file_record.original_file_name)))
-    case_name = sanitize_filename_component(str((llm_result or {}).get("case_or_project_name") or infer_case_name(file_record)))
+    # 사건명은 항상 폴더 구조에서 가져온다 (LLM 결과 무시)
+    case_name = infer_case_name(file_record)
     institution = sanitize_filename_component(str((llm_result or {}).get("institution_or_lawfirm") or infer_institution(extraction.text_excerpt, file_record.original_file_name)))
-    extracted_date = sanitize_filename_component(str((llm_result or {}).get("document_date") or normalize_date(f"{file_record.original_file_name}\n{extraction.text_excerpt}")))
+    # 날짜: LLM 결과 우선, YYYYMMDD 등 비정상 포맷은 YYMMDD로 정규화
+    filename_date = normalize_date(file_record.original_file_name)
+    llm_date_raw = str((llm_result or {}).get("document_date") or "").strip()
+    if llm_date_raw:
+        extracted_date = sanitize_filename_component(_normalize_llm_date(llm_date_raw))
+        # LLM 날짜와 파일명 날짜 연도 차이가 5년 초과이면 파일명 날짜를 신뢰
+        # (LLM이 본문의 오래된 참조 날짜를 발행일로 잘못 읽는 케이스 방어)
+        if (
+            extracted_date and extracted_date != "date_unknown"
+            and filename_date and filename_date != "date_unknown"
+        ):
+            llm_yr = _yymmdd_to_year(extracted_date)
+            fn_yr = _yymmdd_to_year(filename_date)
+            if llm_yr and fn_yr and abs(llm_yr - fn_yr) > 5:
+                extracted_date = filename_date
+    else:
+        extracted_date = sanitize_filename_component(normalize_date(f"{file_record.original_file_name}\n{extraction.text_excerpt}"))
+    if not extracted_date:
+        extracted_date = "date_unknown"
+
     keyword_source_text = extraction.extracted_text or extraction.text_excerpt
     llm_keyword = _normalize_keyword_token(str((llm_result or {}).get("english_keyword") or ""))
-    inferred_keyword = infer_keyword(keyword_source_text, file_record)
-    # Prefer independent text-derived keyword when LLM keyword is noisy or unsupported in the body.
-    if llm_keyword and _keyword_supported_by_text(llm_keyword, keyword_source_text):
+    kw_confidence_threshold = float(config.get("ocr", {}).get("keyword_confidence_threshold", 75.0))
+    ocr_confidence_too_low = (
+        extraction.ocr_used
+        and extraction.ocr_mean_confidence > 0.0
+        and extraction.ocr_mean_confidence < kw_confidence_threshold
+    )
+    if ocr_confidence_too_low:
+        keyword = ""
+    elif llm_keyword:
+        # LLM이 키워드를 제공했으면 본문 지지 여부와 관계없이 우선 사용
+        # (LLM은 실제 문서 내용을 읽었으므로 신뢰)
         keyword = sanitize_filename_component(llm_keyword)
     else:
+        # LLM 키워드 없을 때만 frequency 기반 추출
+        inferred_keyword = infer_keyword(keyword_source_text, file_record)
         keyword = sanitize_filename_component(inferred_keyword)
 
     raw_summary = sanitize_filename_component(str((llm_result or {}).get("summary") or ""))
@@ -632,19 +795,31 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
 
     llm_title = sanitize_filename_component(str((llm_result or {}).get("document_title") or ""))
     mapped_title = _mapped_doc_title(doc_type)
-    if mapped_title:
-        document_title = mapped_title
-    elif llm_title and re.match(r"^[A-Za-z가-힣0-9\s\-]{2,20}$", llm_title):
+    # document_title 우선 — doc_type 대분류보다 이 문서의 구체적 특성을 반영
+    if llm_title and re.match(r"^[A-Za-z가-힣0-9\s\-]{2,20}$", llm_title):
         document_title = _normalize_document_title(llm_title, max_chars=10)
+    elif mapped_title:
+        document_title = mapped_title
     else:
-        document_title = _document_title_from_summary(summary, doc_type)
+        # ③ 최후 수단: LLM이 있으면 summary에서 제목 재생성 요청, 없으면 프로그래매틱 추출
+        if llm_client is not None and summary:
+            generated = llm_client.generate_short_title(summary)
+            if generated:
+                document_title = _normalize_document_title(generated, max_chars=10)
+            else:
+                document_title = _document_title_from_summary(summary, doc_type)
+        else:
+            document_title = _document_title_from_summary(summary, doc_type)
     if document_title == "문서" and doc_type:
         document_title = _document_title_from_summary("", doc_type)
     if not doc_type and not mapped_title and not llm_title:
         document_title = "관련문서"
 
+    raw_abstract = str((llm_result or {}).get("document_abstract") or "").strip()
+
     result = NamingResult(
         extracted_summary=summary,
+        document_abstract=raw_abstract,
         extracted_document_title=document_title,
         extracted_doc_type=doc_type,
         extracted_case_name=case_name,
@@ -671,7 +846,11 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
         result.reason = f"{result.reason} 파일명 길이를 제한에 맞게 잘랐습니다.".strip()
         result.confidence = min(result.confidence, 0.8)
     result.suggested_full_path = build_suggested_path(file_record.original_dir_path, result.suggested_file_name)
-    result.needs_manual_review = evaluate_manual_review(extraction, result, threshold)
+    needs_review, review_reason = evaluate_manual_review(extraction, result, threshold)
+    result.needs_manual_review = needs_review
+    if needs_review and review_reason:
+        prefix = result.reason.strip()
+        result.reason = f"{prefix} [{review_reason}]".strip() if prefix else f"[{review_reason}]"
     result.rollback_name = file_record.original_file_name
     return result
 
@@ -695,11 +874,27 @@ def mark_conflicts(records: list[AnalysisRecord]) -> None:
                     merged = merged.rstrip(" .!?。！？,;:") + "."
                 record.naming.extracted_summary = merged
 
-    counter = Counter(record.naming.suggested_full_path.lower() for record in records if record.naming.suggested_full_path)
+    # Group records by suggested_full_path (case-insensitive) to detect duplicates.
+    from collections import defaultdict
+    path_groups: dict[str, list[AnalysisRecord]] = defaultdict(list)
     for record in records:
-        if counter.get(record.naming.suggested_full_path.lower(), 0) > 1:
+        if record.naming.suggested_full_path:
+            path_groups[record.naming.suggested_full_path.lower()].append(record)
+
+    for group in path_groups.values():
+        if len(group) <= 1:
+            continue
+        # Assign serial numbers (1), (2), ... before the extension to make each unique.
+        for idx, record in enumerate(group, start=1):
+            stem = Path(record.naming.suggested_file_name).stem
+            ext = Path(record.naming.suggested_file_name).suffix
+            new_name = f"{stem}({idx}){ext}"
+            record.naming.suggested_file_name = new_name
+            record.naming.suggested_full_path = build_suggested_path(
+                record.file_record.original_dir_path, new_name
+            )
             record.naming.conflict_detected = True
             record.naming.rename_status = "duplicate_conflict"
-            record.naming.reason = f"{record.naming.reason} 동일 후보 파일명 충돌이 감지되었습니다.".strip()
+            record.naming.reason = f"{record.naming.reason} 동일 후보 파일명 충돌 - 일련번호({idx}) 부여됨.".strip()
             record.naming.confidence = min(record.naming.confidence, 0.84)
             record.naming.needs_manual_review = True

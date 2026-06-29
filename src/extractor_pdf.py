@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+import io
+import os
 import re
+import sys
 import warnings
 
 from models import ExtractionResult
@@ -16,7 +19,14 @@ def _read_pdf_text(path: Path, max_chars: int = 8000) -> tuple[str, int]:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*wrong pointing object.*")
         warnings.filterwarnings("ignore", message=".*invalid object.*")
-        reader = PdfReader(str(path))
+        _devnull = open(os.devnull, "w")
+        _old_stderr = sys.stderr
+        sys.stderr = _devnull
+        try:
+            reader = PdfReader(str(path))
+        finally:
+            sys.stderr = _old_stderr
+            _devnull.close()
     chunks: list[str] = []
     for page in reader.pages:
         try:
@@ -32,19 +42,23 @@ def _read_pdf_text(path: Path, max_chars: int = 8000) -> tuple[str, int]:
 
 def _extract_with_advanced_ocr(path: Path, config: dict, temp_dir: Path, max_chars: int) -> ExtractionResult:
     advanced_cfg = dict(config.get("ocr", {}).get("advanced", {}))
-    result = run_advanced_ocr(path, temp_dir=temp_dir, config=advanced_cfg)
+    timeout_secs = int(advanced_cfg.get("timeout_seconds", 0))
+    result = run_advanced_ocr(path, temp_dir=temp_dir, config=advanced_cfg, timeout_seconds=timeout_secs)
     norm = re.sub(r"\s+", "", result.text or "")
     threshold = int(config["ocr"].get("force_ocr_threshold_chars", 80))
+    # timeout_partial = 타임아웃 내에 처리된 페이지에서 텍스트를 얻은 경우 → 유효한 결과로 처리
+    is_success = result.status in ("success", "timeout_partial") and bool(result.text)
     return ExtractionResult(
         file_type="pdf-image",
-        extraction_status="success" if result.status == "success" else f"advanced_ocr:{result.status}",
+        extraction_status="success" if is_success else f"advanced_ocr:{result.status}",
         extracted_text=result.text,
         text_excerpt=(result.text or "")[:max_chars],
         page_count=result.total_pages,
         ocr_used=True,
         ocr_quality_low=(len(norm) < threshold) or bool(result.failed_pages),
+        ocr_mean_confidence=float(result.mean_confidence or 0.0),
         notes=[
-            "Advanced OCR pipeline used.",
+            f"Advanced OCR pipeline used (status={result.status}).",
             f"Advanced OCR run dir: {result.run_dir}",
             f"Advanced OCR mean confidence: {result.mean_confidence}",
             f"Advanced OCR failed pages: {result.failed_pages}",

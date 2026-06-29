@@ -12,6 +12,7 @@ import tempfile
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import BoundedSemaphore
+import threading
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -24,19 +25,40 @@ from extractor_eml import extract_eml
 from extractor_image import extract_image
 from extractor_pdf import extract_pdf
 from extractor_pptx import extract_pptx
+from extractor_xlsx import extract_xlsx
 from llm_client import OllamaClient
 from models import AnalysisRecord, ExtractionResult, NamingResult
 from naming_engine import infer_case_name, infer_doc_type, infer_institution, mark_conflicts, normalize_date, propose_name
 from rename_executor import execute_rename
 from rollback_executor import execute_rollback
-from scanner import scan_files
+from scanner import scan_files, scan_sharepoint_files
+from sharepoint_client import SharePointClient
 
 SUMMARY_SIGNAL_PATTERN = re.compile(
     r"(agreement|contract|notice|claim|arbitration|opinion|report|memo|"
     r"계약|합의|소송|중재|의견|보고|통지|결의|증명|등기|양해각서|수정계약서)",
     re.IGNORECASE,
 )
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
+
+_LEGAL_META_KEYS = [
+    "case_name_normalized", "case_alias", "case_type", "dispute_type",
+    "document_category", "document_type_normalized", "procedure_stage",
+    "document_purpose", "legal_issue_primary", "legal_issue_secondary",
+    "issue_tags", "claim_type", "party_our_side", "party_counterparty",
+    "party_role", "law_firm_name_normalized", "institution_role",
+    "country_region", "amount_mentioned", "claim_amount", "currency",
+    "amount_context", "event_date", "date_type", "next_action_date",
+    "timeline_summary", "lawyer_summary", "search_summary",
+    "recommended_use", "review_priority", "review_priority_reason",
+    "metadata_limitations", "needs_legal_review",
+]
+
+
+def _extract_legal_metadata(llm_result: dict | None) -> dict:
+    if not llm_result:
+        return {}
+    return {k: llm_result[k] for k in _LEGAL_META_KEYS if k in llm_result}
 
 
 def _format_seconds(total_seconds: float) -> str:
@@ -185,18 +207,21 @@ def _should_call_llm(record, extraction: ExtractionResult, use_llm: bool) -> boo
     return True
 
 
-def _build_analysis_result(record, extraction: ExtractionResult, llm_result: dict | None, config: dict) -> AnalysisRecord:
-    naming = propose_name(record, extraction, llm_result, config)
+def _build_analysis_result(record, extraction: ExtractionResult, llm_result: dict | None, config: dict, llm_client=None) -> AnalysisRecord:
+    naming = propose_name(record, extraction, llm_result, config, llm_client=llm_client)
     if extraction.extraction_status == "manual_review_required":
-        naming.reason = "Legacy .doc requires manual review or external conversion."
+        naming.reason = "구 버전 문서 형식(.doc/.ppt)으로 수동 검토 또는 변환이 필요합니다."
         naming.needs_manual_review = True
         naming.confidence = 0.0
-    return AnalysisRecord(record, extraction, naming)
+    legal_metadata = _extract_legal_metadata(llm_result)
+    return AnalysisRecord(record, extraction, naming, legal_metadata)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Legal DB local folder rename PoC")
-    parser.add_argument("--mode", required=True, choices=["analyze", "rename", "rollback"])
+    parser.add_argument("--mode", required=True, choices=["analyze", "rename", "rollback", "survey"])
+    parser.add_argument("--source", choices=["local", "sharepoint"], default="local",
+                        help="File source: local filesystem (default) or SharePoint via MS Graph API")
     parser.add_argument("--config", default=str(CURRENT_DIR.parent / "config.yaml"))
     parser.add_argument("--review-file")
     parser.add_argument("--rollback-file")
@@ -209,6 +234,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-workers", type=int, help="Max concurrent LLM calls")
     parser.add_argument("--no-cache", action="store_true", help="Do not read/write analysis cache for this run")
     parser.add_argument("--clear-cache", action="store_true", help="Delete analysis cache before analyze")
+    parser.add_argument("--site-url", help="SharePoint site URL (overrides config.yaml sharepoint.site_url)")
+    parser.add_argument("--root-folder", help="Root folder path inside the document library (overrides config.yaml sharepoint.root_folder)")
     return parser.parse_args()
 
 
@@ -244,6 +271,37 @@ def _analyze_single_record(
     cache_key: str,
     ocr_semaphore: BoundedSemaphore,
     llm_semaphore: BoundedSemaphore,
+    sp_client: SharePointClient | None = None,
+    sp_semaphore: BoundedSemaphore | None = None,
+    active_files: dict | None = None,
+) -> tuple[AnalysisRecord, str, dict]:
+    tid = threading.get_ident()
+    if active_files is not None:
+        active_files[tid] = record.original_file_name
+    try:
+        return _analyze_single_record_inner(
+            record, config, temp_dir, llm, use_llm, llm_excerpt_chars,
+            extract_max_chars, cache_key, ocr_semaphore, llm_semaphore,
+            sp_client, sp_semaphore,
+        )
+    finally:
+        if active_files is not None:
+            active_files.pop(tid, None)
+
+
+def _analyze_single_record_inner(
+    record,
+    config: dict,
+    temp_dir: Path,
+    llm: OllamaClient | None,
+    use_llm: bool,
+    llm_excerpt_chars: int,
+    extract_max_chars: int,
+    cache_key: str,
+    ocr_semaphore: BoundedSemaphore,
+    llm_semaphore: BoundedSemaphore,
+    sp_client: SharePointClient | None = None,
+    sp_semaphore: BoundedSemaphore | None = None,
 ) -> tuple[AnalysisRecord, str, dict]:
     if not record.supported:
         extraction = ExtractionResult(
@@ -251,12 +309,23 @@ def _analyze_single_record(
             extraction_status="skipped",
             notes=["Unsupported extension or temporary Office file."],
         )
-        naming = NamingResult(reason="Unsupported format skipped from rename candidates.", confidence=0.0, needs_manual_review=True, rename_status="unsupported", rollback_name=record.original_file_name)
+        naming = NamingResult(reason="지원하지 않는 파일 형식으로 분석 대상에서 제외됩니다.", confidence=0.0, needs_manual_review=True, rename_status="unsupported", rollback_name=record.original_file_name)
         analysis = AnalysisRecord(record, extraction, naming)
         cache_payload = {"extraction": asdict(extraction), "llm_result": None}
         return analysis, cache_key, cache_payload
 
-    path = Path(record.original_full_path)
+    # For SharePoint records, download the file to a local temp path before extraction.
+    if record.sharepoint_item_id and sp_client is not None:
+        sp_dl_dir = temp_dir / "sp_downloads"
+        sem = sp_semaphore or BoundedSemaphore(1)
+        with sem:
+            local_file = sp_client.download_file(
+                record.sharepoint_item_id, record.original_file_name, sp_dl_dir
+            )
+        path = local_file
+    else:
+        path = Path(record.original_full_path)
+
     if record.file_extension == ".pdf":
         with ocr_semaphore:
             extraction = extract_pdf(path, config, temp_dir, max_chars=extract_max_chars)
@@ -273,6 +342,8 @@ def _analyze_single_record(
     elif record.file_extension in (".jpg", ".jpeg", ".tif", ".tiff"):
         with ocr_semaphore:
             extraction = extract_image(path, config, max_chars=extract_max_chars)
+    elif record.file_extension in (".xlsx", ".xls"):
+        extraction = extract_xlsx(path, max_chars=extract_max_chars)
     elif record.file_extension == ".eml":
         extraction = extract_eml(path, max_chars=extract_max_chars)
     else:
@@ -297,12 +368,17 @@ def _analyze_single_record(
                 }
             )
 
-    analysis = _build_analysis_result(record, extraction, llm_result, config)
+    analysis = _build_analysis_result(record, extraction, llm_result, config, llm_client=llm)
     cache_payload = {"extraction": asdict(extraction), "llm_result": llm_result}
     return analysis, cache_key, cache_payload
 
 
-def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
+def analyze(
+    config: dict,
+    project_root: Path,
+    args: argparse.Namespace,
+    sp_client: SharePointClient | None = None,
+) -> int:
     perf = _performance_config(config, args)
     runtime_config = dict(config)
     runtime_config["ocr"] = dict(config.get("ocr", {}))
@@ -312,7 +388,6 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
     if perf["fast"] and perf["fast_disables_llm"]:
         runtime_config["llm"]["enabled"] = False
 
-    input_root = Path(config["input_root"])
     temp_dir = resolve_project_path(project_root, config["temp"]["dir"])
     tempfile.tempdir = str(temp_dir)
     review_dir = resolve_project_path(project_root, config["review"]["output_dir"])
@@ -325,7 +400,17 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
     cache_data = _load_cache(cache_path) if cache_enabled else {"schema_version": CACHE_SCHEMA_VERSION, "entries": {}}
     cache_entries: dict = dict(cache_data.get("entries", {}))
 
-    scanned_records = scan_files(input_root, config)
+    if args.source == "sharepoint":
+        if sp_client is None:
+            raise SystemExit("SharePoint 클라이언트가 초기화되지 않았습니다. --source sharepoint 옵션을 확인하세요.")
+        print("[analyze] SharePoint 파일 목록 조회 중... (Sites.Read.All 권한 필요)")
+        scanned_records = scan_sharepoint_files(sp_client, config)
+        input_root_display = config.get("sharepoint", {}).get("site_url", "SharePoint")
+    else:
+        input_root = Path(config["input_root"])
+        scanned_records = scan_files(input_root, config)
+        input_root_display = str(input_root)
+
     if perf["max_files"] > 0:
         scanned_records = scanned_records[: perf["max_files"]]
 
@@ -376,6 +461,8 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
 
     ocr_semaphore = BoundedSemaphore(perf["ocr_workers"])
     llm_semaphore = BoundedSemaphore(perf["llm_workers"])
+    sp_semaphore = BoundedSemaphore(max(1, perf["workers"])) if sp_client else None
+    active_files: dict[int, str] = {}  # thread_id → filename (GIL로 thread-safe)
 
     with ThreadPoolExecutor(max_workers=perf["workers"]) as executor:
         future_to_record = {
@@ -391,6 +478,9 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
                 record_and_key[1],
                 ocr_semaphore,
                 llm_semaphore,
+                sp_client,
+                sp_semaphore,
+                active_files,
             ): record_and_key[0]
             for record_and_key in uncached_records
         }
@@ -405,7 +495,13 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
                 now = time.monotonic()
                 if now - last_heartbeat >= perf["heartbeat_seconds"]:
                     timing = _build_timing_suffix(start_ts, processed_count, total_count)
-                    print(f"[analyze] heartbeat completed={processed_count}/{total_count} pending={len(pending)} {timing}")
+                    currently = list(active_files.values())
+                    active_str = ", ".join(currently) if currently else "-"
+                    print(
+                        f"[analyze] heartbeat completed={processed_count}/{total_count} "
+                        f"pending={len(pending)} {timing}\n"
+                        f"          active: {active_str}"
+                    )
                     last_heartbeat = now
                 continue
 
@@ -422,7 +518,7 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
                         notes=["Unhandled worker exception."],
                     )
                     naming = NamingResult(
-                        reason="Worker error occurred while analyzing this file.",
+                        reason=f"파일 분석 중 오류가 발생했습니다: {exc}",
                         confidence=0.0,
                         needs_manual_review=True,
                         rename_status="analysis_error",
@@ -458,7 +554,7 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
         raise SystemExit(f"Missing dependency for Excel output: {exc}. Run `pip install -r requirements.txt`.") from exc
 
     summary = {
-        "input_root": str(input_root),
+        "input_root": input_root_display,
         "total_files": len(analysis_records),
         "supported_files": sum(1 for item in analysis_records if item.file_record.supported),
         "manual_review_count": sum(1 for item in analysis_records if item.naming.needs_manual_review),
@@ -471,7 +567,12 @@ def analyze(config: dict, project_root: Path, args: argparse.Namespace) -> int:
     return 0
 
 
-def rename_mode(config: dict, project_root: Path, review_file: str | None) -> int:
+def rename_mode(
+    config: dict,
+    project_root: Path,
+    review_file: str | None,
+    sp_client: SharePointClient | None = None,
+) -> int:
     if not review_file:
         raise SystemExit("--review-file is required for rename mode")
 
@@ -489,16 +590,36 @@ def rename_mode(config: dict, project_root: Path, review_file: str | None) -> in
         config=config,
         logs_dir=resolve_project_path(project_root, config["logs"]["output_dir"]),
         rollback_dir=resolve_project_path(project_root, config["rollback"]["output_dir"]),
+        sp_client=sp_client,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
-def rollback_mode(rollback_file: str | None) -> int:
+def rollback_mode(
+    rollback_file: str | None,
+    sp_client: SharePointClient | None = None,
+) -> int:
     if not rollback_file:
         raise SystemExit("--rollback-file is required for rollback mode")
-    print(json.dumps(execute_rollback(Path(rollback_file)), ensure_ascii=False, indent=2))
+    print(json.dumps(execute_rollback(Path(rollback_file), sp_client=sp_client), ensure_ascii=False, indent=2))
     return 0
+
+
+def survey_mode(config: dict, project_root: Path, sp_client: SharePointClient) -> int:
+    from sp_survey import run_survey
+    logs_dir = resolve_project_path(project_root, config["logs"]["output_dir"])
+    return run_survey(sp_client, config, logs_dir)
+
+
+def _build_sp_client(config: dict, project_root: Path, need_site_scan: bool = False) -> SharePointClient:
+    sp_cfg = config.get("sharepoint", {})
+    token_cache_path = resolve_project_path(
+        project_root, sp_cfg.get("token_cache_path", "./temp/sp_token_cache.json")
+    )
+    client = SharePointClient(sp_cfg, token_cache_path=token_cache_path)
+    client.authenticate(need_site_scan=need_site_scan)
+    return client
 
 
 def main() -> int:
@@ -507,11 +628,36 @@ def main() -> int:
     config = load_config(args.config)
     ensure_directories(config, project_root)
 
+    # --site-url / --root-folder override config (useful for survey across multiple sites)
+    if getattr(args, "site_url", None):
+        config.setdefault("sharepoint", {})
+        config["sharepoint"]["site_url"] = args.site_url
+        # Clear per-site shortcuts so the new URL is resolved fresh
+        config["sharepoint"].pop("drive_id", None)
+        config["sharepoint"].pop("folder_sharing_url", None)
+    if getattr(args, "root_folder", None) is not None:
+        config.setdefault("sharepoint", {})
+        config["sharepoint"]["root_folder"] = args.root_folder
+
+    sp_client: SharePointClient | None = None
+    if getattr(args, "source", "local") == "sharepoint" or args.mode == "survey":
+        sp_cfg = config.get("sharepoint", {})
+        has_shortcut = bool(sp_cfg.get("drive_id") or sp_cfg.get("folder_sharing_url"))
+        need_scan = (args.mode in ("analyze", "survey")) and not has_shortcut
+        sp_client = _build_sp_client(config, project_root, need_site_scan=need_scan)
+
+    if args.mode == "survey":
+        if sp_client is None:
+            raise SystemExit(
+                "[survey] SharePoint 클라이언트를 초기화할 수 없습니다.\n"
+                "  config.yaml의 sharepoint 섹션을 확인하세요."
+            )
+        return survey_mode(config, project_root, sp_client)
     if args.mode == "analyze":
-        return analyze(config, project_root, args)
+        return analyze(config, project_root, args, sp_client=sp_client)
     if args.mode == "rename":
-        return rename_mode(config, project_root, args.review_file)
-    return rollback_mode(args.rollback_file)
+        return rename_mode(config, project_root, args.review_file, sp_client=sp_client)
+    return rollback_mode(args.rollback_file, sp_client=sp_client)
 
 
 if __name__ == "__main__":

@@ -6,23 +6,19 @@ supported_extensions:
   - ".doc"
   - ".pptx"
   - ".ppt"
+  - ".xlsx"
+  - ".xls"
   - ".jpg"
   - ".jpeg"
   - ".tif"
   - ".tiff"
   - ".eml"
 exclude_extensions:
-  - ".xlsx"
-  - ".xls"
   - ".png"
   - ".html"
 llm:
   provider: "openai"
   enabled: true
-  endpoint: "http://127.0.0.1:11434/api/generate"
-  primary_model: "qwen3.5:latest"
-  secondary_model: "qwen3-vl:8b"
-  context_length: 16384
   temperature: 0.1
   timeout_seconds: 90
   openai:
@@ -34,14 +30,16 @@ ocr:
   language: "kor+eng"
   skip_text: true
   force_ocr_threshold_chars: 80
+  keyword_confidence_threshold: 75.0
   timeout_seconds: 180
   advanced:
     enabled: true
-    dpi: 400
+    dpi: 300
     language: "kor+eng"
     min_len: 40
     fallback_to_ocrmypdf: true
     tesseract_cmd: "C:/Program Files/Tesseract-OCR/tesseract.exe"
+    timeout_seconds: 60   # 이 시간 초과 시 처리된 페이지까지만 사용 (0 = 무제한)
 review:
   output_dir: "./output/review"
 logs:
@@ -59,8 +57,23 @@ rename:
   keep_folder_structure: true
   create_rollback_map: true
   path_length_limit: 240
+sharepoint:
+  # Set enabled: true and fill in credentials to use SharePoint mode.
+  # Run: python src/main.py --mode analyze --source sharepoint
+  enabled: false
+  tenant_id: "b9501eff-d05e-4bf1-8a87-898d83f46ceb"
+  client_id: "2093532b-df4b-4825-83a9-2c3666ec7db0"
+  site_url: "https://poscointl1.sharepoint.com/sites/DX-DB"
+  drive_name: "Documents"       # SharePoint document library display name
+  root_folder: "법무DB (테스트)"  # Sub-folder inside the library (empty = library root)
+  token_cache_path: "./temp/sp_token_cache.json"
+  ssl_verify: false   # 회사 SSL 검사 프록시 환경에서는 false로 설정
+  # drive_id: ""   # 선택사항: 테스트 실행 후 출력된 drive_id를 입력하면 Sites.Read.All 없이도 스캔 가능
+  folder_sharing_url: "https://poscointl1.sharepoint.com/:f:/s/DX-DB/IgCQAQRjHIk0SbBnci9HWhCRAU_vHspdPVUezfWf_qfKBwI?e=wu11cv"
 performance:
-  workers: 4
+  workers: 6
+  ocr_workers: 4
+  llm_workers: 4
   progress_every: 10
   heartbeat_seconds: 30
   max_files: 0

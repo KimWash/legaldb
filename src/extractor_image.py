@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
+import re
 
 from models import ExtractionResult
 
 
+def _imread_unicode(path: Path):
+    """cv2.imread replacement that handles Unicode/Korean paths on Windows."""
+    import cv2
+    import numpy as np
+
+    buf = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    return image
+
+
 def extract_image(path: Path, config: dict, max_chars: int = 8000) -> ExtractionResult:
-    """Extract text from a JPG/JPEG image file via Tesseract OCR."""
+    """Extract text from a JPG/JPEG/TIF/TIFF image file via Tesseract OCR."""
     try:
-        import cv2
         import pytesseract
         from ocr_advanced import (
             _preprocess_image,
@@ -24,35 +33,19 @@ def extract_image(path: Path, config: dict, max_chars: int = 8000) -> Extraction
         tesseract_cmd = _resolve_tesseract_cmd(advanced_cfg)
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
-        try:
-            subprocess.run(
-                [tesseract_cmd, "--version"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except Exception as exc:
-            return ExtractionResult(
-                file_type="image",
-                extraction_status=f"tesseract_not_available:{exc}",
-                ocr_quality_low=True,
-                notes=["Tesseract is not available."],
-            )
-
-        image = cv2.imread(str(path))
+        image = _imread_unicode(path)
         if image is None:
             return ExtractionResult(
                 file_type="image",
                 extraction_status="error:cannot_read_image",
                 ocr_quality_low=True,
-                notes=["cv2 could not read the image file."],
+                notes=[f"Could not read image file (possibly unsupported format or corrupt): {path.name}"],
             )
 
         preprocessed = _preprocess_image(image)
         text, conf, psm, used_crop, _ = _choose_best_text(preprocessed, min_len=min_len, lang=lang)
 
         threshold = int(ocr_cfg.get("force_ocr_threshold_chars", 80))
-        import re
         norm = re.sub(r"\s+", "", text or "")
         quality_low = len(norm) < threshold
 
@@ -73,9 +66,7 @@ def extract_image(path: Path, config: dict, max_chars: int = 8000) -> Extraction
             page_count=1,
             ocr_used=True,
             ocr_quality_low=quality_low,
-            notes=[
-                f"Image OCR via Tesseract. psm={psm} conf={conf:.1f} cropped={used_crop}"
-            ],
+            notes=[f"Image OCR via Tesseract. psm={psm} conf={conf:.1f} cropped={used_crop}"],
         )
 
     except ModuleNotFoundError as exc:

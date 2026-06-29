@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from models import ExtractionResult
@@ -8,7 +9,6 @@ from models import ExtractionResult
 def extract_pptx(path: Path, max_chars: int = 8000) -> ExtractionResult:
     try:
         from pptx import Presentation
-        from pptx.util import Pt
 
         prs = Presentation(str(path))
         lines: list[str] = []
@@ -68,8 +68,75 @@ def extract_pptx(path: Path, max_chars: int = 8000) -> ExtractionResult:
             notes=["python-pptx is not installed. Run: pip install python-pptx"],
         )
     except Exception as exc:
+        if sys.platform != "win32":
+            return ExtractionResult(
+                file_type="pptx",
+                extraction_status=f"error:{exc}",
+                notes=["PPTX extraction failed."],
+            )
+        # Windows: MIP 보호 파일일 수 있으므로 PowerPoint COM으로 재시도
+        return _extract_pptx_via_com(path, max_chars, fallback_error=str(exc))
+
+
+def _extract_pptx_via_com(path: Path, max_chars: int, fallback_error: str) -> ExtractionResult:
+    """MIP-보호 PPTX를 PowerPoint COM으로 열어 텍스트 추출."""
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
         return ExtractionResult(
             file_type="pptx",
-            extraction_status=f"error:{exc}",
-            notes=["PPTX extraction failed."],
+            extraction_status=f"error:{fallback_error}",
+            notes=["PPTX extraction failed. pywin32 not installed for COM fallback."],
         )
+
+    ppt = None
+    try:
+        ppt = win32com.client.Dispatch("PowerPoint.Application")
+        ppt.Visible = False
+        pres = ppt.Presentations.Open(
+            str(path.resolve()),
+            ReadOnly=True,
+            Untitled=False,
+            WithWindow=False,
+        )
+        lines: list[str] = []
+        slide_count = pres.Slides.Count
+        for i in range(1, slide_count + 1):
+            slide = pres.Slides(i)
+            for j in range(1, slide.Shapes.Count + 1):
+                try:
+                    shape = slide.Shapes(j)
+                    if shape.HasTextFrame:
+                        text = shape.TextFrame.TextRange.Text.strip()
+                        if text:
+                            lines.append(text)
+                except Exception:
+                    pass
+        pres.Close()
+        combined = "\n".join(lines).strip()
+        if not combined:
+            return ExtractionResult(
+                file_type="pptx",
+                extraction_status="empty_text",
+                notes=["COM fallback: No text extracted from PPTX."],
+            )
+        return ExtractionResult(
+            file_type="pptx",
+            extraction_status="success",
+            extracted_text=combined,
+            text_excerpt=combined[:max_chars],
+            page_count=slide_count,
+            notes=[f"COM fallback (MIP): PPTX text extracted. {slide_count} slides."],
+        )
+    except Exception as com_exc:
+        return ExtractionResult(
+            file_type="pptx",
+            extraction_status=f"error:{fallback_error}",
+            notes=[f"PPTX extraction failed. COM fallback also failed: {com_exc}"],
+        )
+    finally:
+        if ppt is not None:
+            try:
+                ppt.Quit()
+            except Exception:
+                pass

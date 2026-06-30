@@ -4,6 +4,8 @@ from pathlib import Path
 import json
 import os
 import re
+import threading
+import time
 
 try:
     from dotenv import load_dotenv
@@ -12,6 +14,20 @@ except Exception:
 
 
 class LLMClient:
+    _lock = threading.Lock()
+    _last_request_time = 0.0
+    _min_interval = 0.015  # RPM 4000 기준: 60 / 4000 = 0.015초
+
+    @classmethod
+    def _wait_for_rate_limit(cls):
+        with cls._lock:
+            now = time.time()
+            elapsed = now - cls._last_request_time
+            if elapsed < cls._min_interval:
+                sleep_time = cls._min_interval - elapsed
+                time.sleep(sleep_time)
+            cls._last_request_time = time.time()
+
     def __init__(self, config: dict, project_root: Path) -> None:
         env_path = project_root / ".env"
         if load_dotenv is not None and env_path.exists():
@@ -100,50 +116,83 @@ class LLMClient:
             "- Korean preferred; English only for proper nouns or untranslatable legal terms\n"
             "- Must convey the core legal action or document type specifically\n"
             "- Do NOT use generic words: 문서, 파일, 자료, document\n"
+            "- If personal names appear, mask them (e.g. 홍길동 -> 홍*동, 허준 -> 허*). Do NOT mask corporate/institution/project names.\n"
             "- Return ONLY the title text, no explanation, no punctuation\n\n"
             f"Summary: {summary}\n\nTitle:"
         )
-        try:
-            import requests
-            headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
-            resp = requests.post(
-                f"{self.base_url}/models/{self.model}:generateContent",
-                headers=headers,
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.0, "maxOutputTokens": 30},
-                },
-                timeout=30,
-            )
-            if resp.ok:
+        import time
+        import sys
+        import requests
+        headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+        max_retries = 3
+        backoff_factor = 2
+        for attempt in range(max_retries):
+            try:
+                self._wait_for_rate_limit()
+                resp = requests.post(
+                    f"{self.base_url}/models/{self.model}:generateContent",
+                    headers=headers,
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 30},
+                    },
+                    timeout=30,
+                )
+                if resp.status_code == 429:
+                    sleep_time = backoff_factor ** attempt + 1
+                    print(f"[warning] Gemini generate_short_title rate limit (429). Retrying in {sleep_time}s... (Attempt {attempt+1}/{max_retries})", file=sys.stderr)
+                    time.sleep(sleep_time)
+                    continue
+                resp.raise_for_status()
                 return self._extract_text_from_gemini(resp.json())
-        except Exception:
-            pass
+            except Exception as exc:
+                if attempt == max_retries - 1:
+                    print(f"[error] Gemini generate_short_title failed after {max_retries} attempts: {exc}", file=sys.stderr)
+                    return ""
+                sleep_time = backoff_factor ** attempt + 1
+                print(f"[warning] Gemini generate_short_title failed with exception. Retrying in {sleep_time}s... (Error: {exc})", file=sys.stderr)
+                time.sleep(sleep_time)
         return ""
 
     def _call_gemini(self, prompt: str) -> dict | None:
+        import time
+        import sys
+        import requests
         headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
-        try:
-            import requests
-
-            response = requests.post(
-                f"{self.base_url}/models/{self.model}:generateContent",
-                headers=headers,
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "temperature": self.temperature,
-                        # JSON 스키마 응답을 강제해 파싱 신뢰도를 높인다
-                        "responseMimeType": "application/json",
+        max_retries = 3
+        backoff_factor = 2
+        for attempt in range(max_retries):
+            try:
+                self._wait_for_rate_limit()
+                response = requests.post(
+                    f"{self.base_url}/models/{self.model}:generateContent",
+                    headers=headers,
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "temperature": self.temperature,
+                            # JSON 스키마 응답을 강제해 파싱 신뢰도를 높인다
+                            "responseMimeType": "application/json",
+                        },
                     },
-                },
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
-            raw = self._extract_text_from_gemini(response.json())
-            return self._parse_json(raw or "")
-        except Exception:
-            return None
+                    timeout=self.timeout_seconds,
+                )
+                if response.status_code == 429:
+                    sleep_time = backoff_factor ** attempt + 1
+                    print(f"[warning] Gemini API rate limit exceeded (429). Retrying in {sleep_time}s... (Attempt {attempt+1}/{max_retries})", file=sys.stderr)
+                    time.sleep(sleep_time)
+                    continue
+                response.raise_for_status()
+                raw = self._extract_text_from_gemini(response.json())
+                return self._parse_json(raw or "")
+            except Exception as exc:
+                if attempt == max_retries - 1:
+                    print(f"[error] Gemini API call failed after {max_retries} attempts: {exc}", file=sys.stderr)
+                    return None
+                sleep_time = backoff_factor ** attempt + 1
+                print(f"[warning] Gemini API call failed with exception. Retrying in {sleep_time}s... (Error: {exc})", file=sys.stderr)
+                time.sleep(sleep_time)
+        return None
 
     def _build_prompt(self, payload: dict) -> str:
         schema = {
@@ -200,6 +249,15 @@ class LLMClient:
             "Output JSON only and follow the schema exactly.\n\n"
             "CORE PRINCIPLE: The filename is NOT a keyword list. It must be a title that lets a legal professional\n"
             "instantly understand the document's nature and key issue — like a proper case file label.\n\n"
+            "PERSONAL NAME MASKING RULES (CRITICAL - PRIVACY PROTECTION):\n"
+            "  If personal names (both Korean and foreign) appear in 'summary', 'document_abstract', 'document_title', or 'suggested_filename', you MUST mask them:\n"
+            "  - Korean names:\n"
+            "    - 3-character names: Mask the middle character (e.g., 홍길동 -> 홍*동, 이민우 -> 이*우)\n"
+            "    - 2-character names: Mask the last character (e.g., 허준 -> 허*)\n"
+            "    - 4+ character names: Mask the middle characters except the family name (e.g., 남궁만수 -> 남궁*수, 선우진우 -> 선우*우)\n"
+            "  - Foreign names: Keep the family name, and mask the given name except its first initial (e.g., John Doe -> J*n Doe or J. Doe)\n"
+            "  - Do NOT mask corporate names, group names, institutions, or project names (only mask individual human names).\n"
+            "  - However, for metadata fields like 'party_our_side' and 'party_counterparty', return the original, unmasked names as they are used for database matching.\n\n"
             "summary rules: exactly one sentence, max 80 characters, no greeting/signature/disclaimer boilerplate.\n"
             "Write a meaningful summary describing the specific legal action, parties, and subject matter.\n"
             "Example good summaries: '두바이 Sunrise 소송 관련 법률통지문 (Al Dhaheri)', '수단 대우아파트 PJT 토지매매 예비계약서', 'SIAC 중재 청구서 - 계약 위반 손해배상 청구'\n"
@@ -210,7 +268,7 @@ class LLMClient:
             "  Write 3–5 natural Korean sentences, max 400 characters total.\n"
             "  Cover ALL of the following that are present in the document:\n"
             "    1) 문서 성격·목적 (어떤 법적 행위를 담은 문서인가)\n"
-            "    2) 당사자 (원고/피고, 갑/을, 발신인/수신인 등 실명 명시)\n"
+            "    2) 당사자 (원고/피고, 갑/을, 발신인/수신인 등 실명 표기하되 반드시 마스킹 룰 적용)\n"
             "    3) 핵심 법적 쟁점 또는 계약 내용\n"
             "    4) 주요 일자 (계약일·제출일·판결일 등)\n"
             "    5) 금액·규모 (통화 포함, 있는 경우)\n"

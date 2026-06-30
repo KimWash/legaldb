@@ -1090,6 +1090,10 @@ function _setRowStatus(seq, badgeHtml, addCls) {
   if (addCls) tr.classList.add(addCls);
 }
 
+let _renameEs = null;
+let _renameStartTime = 0;
+let _renameTimer = null;
+
 async function executeRename() {
   const selected = _allRecords.filter(r => _selectedSeqs.has(r.seq));
   if (!selected.length) return;
@@ -1103,6 +1107,28 @@ async function executeRename() {
   selected.forEach(r =>
     _setRowStatus(r.seq, `<span class="sbadge sbadge-processing">처리중</span>`)
   );
+
+  // 진행률 카드 초기화 및 표시
+  const progressCard = $('sec-rename-progress');
+  if (progressCard) {
+    progressCard.classList.remove('hidden');
+    $('rename-progress-bar').style.width = '0%';
+    $('rename-progress-text').textContent = `0 / ${selected.length}`;
+    $('rename-stat-processed').textContent = '0';
+    $('rename-stat-success').textContent = '0';
+    $('rename-stat-failed').textContent = '0';
+    $('rename-elapsed').textContent = '0초';
+  }
+
+  // 기존 SSE 연결이 있으면 닫기
+  if (_renameEs) {
+    _renameEs.close();
+    _renameEs = null;
+  }
+  if (_renameTimer) {
+    clearInterval(_renameTimer);
+    _renameTimer = null;
+  }
 
   try {
     const res = await fetch('/api/rename', {
@@ -1124,51 +1150,127 @@ async function executeRename() {
     if (data.error) {
       // 실패 시 원래 상태로 복원
       selected.forEach(r => _setRowStatus(r.seq, statusBadge(r)));
+      progressCard?.classList.add('hidden');
       showError(data.error);
-    } else {
-      const ok   = data.success_count ?? 0;
-      const fail = (data.processed_count ?? ok) - ok;
-
-      // 파일별 결과 맵 구성 (original_full_path → status)
-      const resultMap = {};
-      (data.file_results || []).forEach(fr => { resultMap[fr.original_full_path] = fr.status; });
-
-      // 폴더 이름 변경 이력 저장
-      _markFoldersRenamed(selected);
-
-      // 순차적으로 "완료"/"실패" 상태로 전환 (40ms 스태거)
-      for (let i = 0; i < selected.length; i++) {
-        const r = selected[i];
-        const fileStatus = resultMap[r.original_full_path] ?? 'success';
-        if (fileStatus === 'rename_failed') {
-          r.rename_failed = true;
-        } else {
-          r.is_renamed = true;
-        }
-        _setRowStatus(r.seq, statusBadge(r), r.is_renamed ? 'row-renamed' : null);
-        if (i < selected.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 40));
-        }
-      }
-
-      showSuccessBanner(`파일명 변경 완료: ${ok}개 성공` + (fail ? `, ${fail}개 실패` : ''));
-      setStep(5);
-
-      // 체크박스 선택 상태 해제 (테이블 재빌드 없이)
-      _selectedSeqs.clear();
-      $('review-tbody').querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = false; });
-      $('check-all').checked = false;
-      $('check-all').indeterminate = false;
-      updateSelectedCount();
-      updateActionBar(_allRecords);
-      await loadRollbackList();
+      btn.disabled = false;
+      btn.innerHTML = origHTML;
+      return;
     }
+
+    // 타이머 시작
+    _renameStartTime = Date.now();
+    _renameTimer = setInterval(() => {
+      const sec = Math.round((Date.now() - _renameStartTime) / 1000);
+      $('rename-elapsed').textContent = `${sec}초`;
+    }, 1000);
+
+    // SSE 연결 수립
+    _renameEs = new EventSource('/api/rename/stream');
+    _renameEs.onmessage = async (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch (_) { return; }
+
+      if (msg.type === 'sync' || msg.type === 'progress') {
+        const processed = msg.processed ?? 0;
+        const total = msg.total ?? selected.length;
+        const success = msg.success_count ?? 0;
+        const failed = msg.failed_count ?? 0;
+
+        // UI 통계 업데이트
+        const pct = total > 0 ? Math.round(processed / total * 100) : 0;
+        $('rename-progress-bar').style.width = `${pct}%`;
+        $('rename-progress-text').textContent = `${processed} / ${total}`;
+        $('rename-stat-processed').textContent = processed.toLocaleString('ko-KR');
+        $('rename-stat-success').textContent = success.toLocaleString('ko-KR');
+        $('rename-stat-failed').textContent = failed.toLocaleString('ko-KR');
+
+        // 진행 시 개별 아이템 테이블 행 상태 변경
+        if (msg.item) {
+          const item = msg.item;
+          const r = selected.find(x => x.original_full_path === item.original_full_path);
+          if (r) {
+            if (item.status === 'success') {
+              r.is_renamed = true;
+              r.rename_failed = false;
+            } else {
+              r.rename_failed = true;
+              r.is_renamed = false;
+            }
+            _setRowStatus(r.seq, statusBadge(r), r.is_renamed ? 'row-renamed' : null);
+          }
+        }
+      } else if (msg.type === 'complete') {
+        cleanupRenameSSE();
+
+        const ok = msg.success_count ?? 0;
+        const fail = msg.failed_count ?? 0;
+
+        // 전체 완료 처리 후 배지 동기화
+        const resultMap = {};
+        (msg.result?.file_results || []).forEach(fr => { resultMap[fr.original_full_path] = fr.status; });
+        
+        selected.forEach(r => {
+          const fileStatus = resultMap[r.original_full_path] ?? (r.is_renamed ? 'success' : 'rename_failed');
+          if (fileStatus === 'rename_failed') {
+            r.rename_failed = true;
+            r.is_renamed = false;
+          } else {
+            r.is_renamed = true;
+            r.rename_failed = false;
+          }
+          _setRowStatus(r.seq, statusBadge(r), r.is_renamed ? 'row-renamed' : null);
+        });
+
+        // 폴더 이름 변경 이력 저장
+        _markFoldersRenamed(selected);
+
+        showSuccessBanner(`파일명 변경 완료: ${ok}개 성공` + (fail ? `, ${fail}개 실패` : ''));
+        setStep(5);
+
+        // 체크박스 선택 상태 해제
+        _selectedSeqs.clear();
+        $('review-tbody').querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = false; });
+        $('check-all').checked = false;
+        $('check-all').indeterminate = false;
+        updateSelectedCount();
+        updateActionBar(_allRecords);
+        await loadRollbackList();
+
+        btn.disabled = false;
+        btn.innerHTML = origHTML;
+
+      } else if (msg.type === 'error') {
+        cleanupRenameSSE();
+        selected.forEach(r => _setRowStatus(r.seq, statusBadge(r)));
+        progressCard?.classList.add('hidden');
+        showError('파일명 변경 오류: ' + msg.error);
+        btn.disabled = false;
+        btn.innerHTML = origHTML;
+      }
+    };
+
+    _renameEs.onerror = () => {
+      console.error('[rename] EventSource connection error');
+    };
+
   } catch (e) {
+    cleanupRenameSSE();
     selected.forEach(r => _setRowStatus(r.seq, statusBadge(r)));
+    progressCard?.classList.add('hidden');
     showError('파일명 변경 실패: ' + e.message);
-  } finally {
     btn.disabled = false;
     btn.innerHTML = origHTML;
+  }
+}
+
+function cleanupRenameSSE() {
+  if (_renameEs) {
+    _renameEs.close();
+    _renameEs = null;
+  }
+  if (_renameTimer) {
+    clearInterval(_renameTimer);
+    _renameTimer = null;
   }
 }
 

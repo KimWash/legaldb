@@ -117,6 +117,38 @@ _analysis_subs: list[asyncio.Queue] = []
 _main_loop: asyncio.AbstractEventLoop | None = None
 
 
+# ── Rename session ────────────────────────────────────────────────────
+
+@dataclass
+class RenameSession:
+    status: str = "idle"      # idle | running | complete | error
+    total: int = 0
+    processed: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    results: list[dict] = field(default_factory=list)
+    log_jsonl: str = ""
+    result_csv: str = ""
+    rollback_file: str = ""
+
+_rename_session = RenameSession()
+_rename_session_lock = threading.Lock()
+_rename_subs: list[asyncio.Queue] = []
+
+
+def _broadcast_rename(event: dict) -> None:
+    if _main_loop is None:
+        return
+    data = json.dumps(event, ensure_ascii=False)
+    def _put():
+        for q in list(_rename_subs):
+            try:
+                q.put_nowait(data)
+            except Exception:
+                pass
+    _main_loop.call_soon_threadsafe(_put)
+
+
 def _broadcast(event: dict) -> None:
     if _main_loop is None:
         return
@@ -879,50 +911,164 @@ class RenameRequest(BaseModel):
 async def rename_files(req: RenameRequest):
     if not req.items:
         return {"error": "선택된 항목이 없습니다."}
+    
+    with _rename_session_lock:
+        if _rename_session.status == "running":
+            return {"error": "이미 파일명 변경이 진행 중입니다."}
+        _rename_session.status = "running"
+        _rename_session.total = len(req.items)
+        _rename_session.processed = 0
+        _rename_session.success_count = 0
+        _rename_session.failed_count = 0
+        _rename_session.results = []
+        _rename_session.log_jsonl = ""
+        _rename_session.result_csv = ""
+        _rename_session.rollback_file = ""
+
     sp_client = _get_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
     if sp_client is None and req.site_url:
         sp_client = _make_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
+
     review_rows = [
         {"approval": "Y", "original_full_path": it.original_full_path,
          "suggested_full_path": it.suggested_full_path, "sharepoint_item_id": it.sharepoint_item_id}
         for it in req.items
     ]
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: execute_rename(
-        review_rows=review_rows,
-        config=_config,
-        logs_dir=resolve_project_path(PROJECT_ROOT, _config["logs"]["output_dir"]),
-        rollback_dir=resolve_project_path(PROJECT_ROOT, _config["rollback"]["output_dir"]),
-        sp_client=sp_client,
-        site_url=req.site_url,
-    ))
 
-    # 수동수정 항목이 있으면 AnalysisRecord 갱신 후 Excel 재생성
-    manually_edited_paths = {it.original_full_path for it in req.items if it.manually_edited}
-    if manually_edited_paths:
-        path_to_suggested = {it.original_full_path: it.suggested_full_path for it in req.items}
-        with _session_lock:
-            analysis_records = list(_session.all_analysis_records)
-            review_path = _session.review_path
-        if analysis_records and review_path:
-            for ar in analysis_records:
-                orig = ar.file_record.original_full_path
-                if orig in manually_edited_paths:
-                    new_sfp = path_to_suggested[orig]
-                    ar.naming.suggested_full_path = new_sfp
-                    ar.naming.suggested_file_name = Path(new_sfp).name
-                    ar.naming.manually_edited = True
-            try:
-                new_wb = write_review_workbook(analysis_records, Path(review_path).parent)
-                old = Path(review_path)
+    loop = asyncio.get_running_loop()
+
+    def progress_callback(event: dict):
+        with _rename_session_lock:
+            _rename_session.processed += 1
+            if event["status"] == "success":
+                _rename_session.success_count += 1
+            else:
+                _rename_session.failed_count += 1
+            _rename_session.results.append({
+                "original_full_path": event["original_full_path"],
+                "new_full_path": event["new_full_path"],
+                "status": event["status"],
+                "reason": event["reason"]
+            })
+            
+            _broadcast_rename({
+                "type": "progress",
+                "processed": _rename_session.processed,
+                "total": _rename_session.total,
+                "success_count": _rename_session.success_count,
+                "failed_count": _rename_session.failed_count,
+                "item": {
+                    "original_full_path": event["original_full_path"],
+                    "new_full_path": event["new_full_path"],
+                    "status": event["status"],
+                    "reason": event["reason"]
+                }
+            })
+
+    async def _bg_rename():
+        try:
+            result = await loop.run_in_executor(None, lambda: execute_rename(
+                review_rows=review_rows,
+                config=_config,
+                logs_dir=resolve_project_path(PROJECT_ROOT, _config["logs"]["output_dir"]),
+                rollback_dir=resolve_project_path(PROJECT_ROOT, _config["rollback"]["output_dir"]),
+                sp_client=sp_client,
+                site_url=req.site_url,
+                progress_callback=progress_callback
+            ))
+
+            manually_edited_paths = {it.original_full_path for it in req.items if it.manually_edited}
+            if manually_edited_paths:
+                path_to_suggested = {it.original_full_path: it.suggested_full_path for it in req.items}
                 with _session_lock:
-                    _session.review_path = str(new_wb)
-                if old.exists() and old != new_wb:
-                    old.unlink(missing_ok=True)
-            except Exception as exc:
-                print(f"[rename] Excel 재생성 실패: {exc}")
+                    analysis_records = list(_session.all_analysis_records)
+                    review_path = _session.review_path
+                if analysis_records and review_path:
+                    for ar in analysis_records:
+                        orig = ar.file_record.original_full_path
+                        if orig in manually_edited_paths:
+                            new_sfp = path_to_suggested[orig]
+                            ar.naming.suggested_full_path = new_sfp
+                            ar.naming.suggested_file_name = Path(new_sfp).name
+                            ar.naming.manually_edited = True
+                    try:
+                        new_wb = write_review_workbook(analysis_records, Path(review_path).parent)
+                        old = Path(review_path)
+                        with _session_lock:
+                            _session.review_path = str(new_wb)
+                        if old.exists() and old != new_wb:
+                            old.unlink(missing_ok=True)
+                    except Exception as exc:
+                        print(f"[rename] Excel 재생성 실패: {exc}")
 
-    return result
+            with _rename_session_lock:
+                _rename_session.status = "complete"
+                _rename_session.log_jsonl = result.get("log_jsonl", "")
+                _rename_session.result_csv = result.get("result_csv", "")
+                _rename_session.rollback_file = result.get("rollback_file", "")
+            
+            _broadcast_rename({
+                "type": "complete",
+                "processed": _rename_session.processed,
+                "total": _rename_session.total,
+                "success_count": _rename_session.success_count,
+                "failed_count": _rename_session.failed_count,
+                "result": result
+            })
+        except Exception as exc:
+            print(f"[rename] Background error: {exc}")
+            with _rename_session_lock:
+                _rename_session.status = "error"
+            _broadcast_rename({
+                "type": "error",
+                "error": str(exc)
+            })
+
+    asyncio.create_task(_bg_rename())
+    return {"status": "started"}
+
+
+@app.get("/api/rename/stream")
+async def rename_stream():
+    q: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _rename_subs.append(q)
+    with _rename_session_lock:
+        initial = {
+            "type": "sync",
+            "status": _rename_session.status,
+            "total": _rename_session.total,
+            "processed": _rename_session.processed,
+            "success_count": _rename_session.success_count,
+            "failed_count": _rename_session.failed_count,
+            "results": list(_rename_session.results),
+        }
+
+    async def generate():
+        try:
+            yield f"data: {json.dumps(initial, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if item is None:
+                    break
+                yield f"data: {item}\n\n"
+                try:
+                    event_type = json.loads(item).get("type")
+                    if event_type in ("complete", "error"):
+                        break
+                except Exception:
+                    break
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        finally:
+            if q in _rename_subs:
+                _rename_subs.remove(q)
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/rollback/list")

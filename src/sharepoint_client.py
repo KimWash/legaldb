@@ -162,6 +162,18 @@ class SharePointClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _post(self, url: str, body: dict) -> dict:
+        """Send a POST request (used for $batch endpoint)."""
+        resp = requests.post(
+            url,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            json=body,
+            timeout=60,
+            verify=self._ssl_verify,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ------------------------------------------------------------------
     # Site / drive resolution
     # ------------------------------------------------------------------
@@ -742,3 +754,108 @@ class SharePointClient:
             f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}",
             {"name": new_name},
         )
+
+    # ------------------------------------------------------------------
+    # Batch rename (JSON Batching — official spec: max 20 per call)
+    # https://learn.microsoft.com/en-us/graph/json-batching
+    # ------------------------------------------------------------------
+
+    def batch_rename_items(
+        self,
+        items: list[dict],
+    ) -> list[dict]:
+        """Rename multiple drive items using a single $batch call (max 20).
+
+        Parameters
+        ----------
+        items:
+            List of dicts, each containing:
+              - ``item_id``  (str): DriveItem ID to rename.
+              - ``new_name`` (str): Target filename (name only, no path).
+
+        Returns
+        -------
+        list[dict]
+            One result dict per input item in the same order::
+
+                {
+                    "item_id":  str,
+                    "new_name": str,
+                    "status":   int,   # HTTP status of this individual request
+                    "ok":       bool,  # True if status in (200, 204)
+                    "retry_after": int | None,  # seconds to wait on 429
+                    "error":    str,   # error message string if not ok
+                }
+
+        Notes
+        -----
+        * Caller is responsible for splitting into chunks of ≤20 and for
+          honouring ``retry_after`` values when 429 responses are returned.
+        * Official spec: url must be a *relative* path (no hostname);
+          Content-Type header is required when a body is present.
+        """
+        if not items:
+            return []
+        if len(items) > 20:
+            raise ValueError(
+                f"batch_rename_items: max 20 requests per batch, got {len(items)}."
+            )
+
+        drive_id = self._resolve_drive()
+
+        # Build the $batch request body — relative URLs as required by the spec.
+        batch_requests = [
+            {
+                "id": str(idx),
+                "method": "PATCH",
+                "url": f"/drives/{drive_id}/items/{item['item_id']}",
+                "headers": {"Content-Type": "application/json"},
+                "body": {"name": item["new_name"]},
+            }
+            for idx, item in enumerate(items)
+        ]
+
+        resp_body = self._post(
+            f"{GRAPH_BASE}/$batch",
+            {"requests": batch_requests},
+        )
+
+        # Index individual responses by their id string.
+        resp_map: dict[str, dict] = {
+            r["id"]: r for r in resp_body.get("responses", [])
+        }
+
+        results: list[dict] = []
+        for idx, item in enumerate(items):
+            r = resp_map.get(str(idx), {})
+            status = r.get("status", 0)
+            ok = status in (200, 204)
+
+            # Extract retry-after from nested JSON body on 429.
+            retry_after: int | None = None
+            error_msg = ""
+            if not ok:
+                body = r.get("body") or {}
+                err = body.get("error", {}) if isinstance(body, dict) else {}
+                error_msg = err.get("message", f"HTTP {status}")
+                # retry-after may appear as a response header (string) or in body
+                headers_r = r.get("headers") or {}
+                ra_str = headers_r.get("Retry-After") or headers_r.get("retry-after")
+                if ra_str:
+                    try:
+                        retry_after = int(ra_str)
+                    except ValueError:
+                        pass
+
+            results.append(
+                {
+                    "item_id": item["item_id"],
+                    "new_name": item["new_name"],
+                    "status": status,
+                    "ok": ok,
+                    "retry_after": retry_after,
+                    "error": error_msg,
+                }
+            )
+
+        return results

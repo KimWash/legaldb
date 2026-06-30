@@ -399,6 +399,36 @@
   <!-- Phase 3: Review + Rename + Rollback -->
   <section id="sec-review" class="hidden">
 
+    <!-- Rename Progress -->
+    <div id="sec-rename-progress" class="card hidden">
+      <div class="card-header">
+        <h3>파일명 변경 진행</h3>
+        <span id="rename-elapsed" class="card-hint">0초</span>
+      </div>
+      <div class="card-body">
+        <div class="progress-wrap">
+          <div class="progress-track">
+            <div id="rename-progress-bar" class="progress-fill" style="width: 0%;"></div>
+          </div>
+          <span id="rename-progress-text" class="progress-text">0 / 0</span>
+        </div>
+        <div class="a-stats-row">
+          <div class="a-stat">
+            <div class="a-stat-val" id="rename-stat-processed">0</div>
+            <div class="a-stat-lbl">처리 완료</div>
+          </div>
+          <div class="a-stat">
+            <div class="a-stat-val a-stat-val--green" id="rename-stat-success">0</div>
+            <div class="a-stat-lbl">성공</div>
+          </div>
+          <div class="a-stat">
+            <div class="a-stat-val a-stat-val--red" id="rename-stat-failed">0</div>
+            <div class="a-stat-lbl">실패</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header">
         <span class="step-badge">4</span>

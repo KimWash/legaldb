@@ -78,6 +78,8 @@ def extract_pptx(path: Path, max_chars: int = 8000) -> ExtractionResult:
         return _extract_pptx_via_com(path, max_chars, fallback_error=str(exc))
 
 
+from com_lock import ppt_lock
+
 def _extract_pptx_via_com(path: Path, max_chars: int, fallback_error: str) -> ExtractionResult:
     """MIP-보호 PPTX를 PowerPoint COM으로 열어 텍스트 추출."""
     try:
@@ -90,29 +92,42 @@ def _extract_pptx_via_com(path: Path, max_chars: int, fallback_error: str) -> Ex
         )
 
     ppt = None
+    com_initialized = False
     try:
-        ppt = win32com.client.Dispatch("PowerPoint.Application")
-        ppt.Visible = False
-        pres = ppt.Presentations.Open(
-            str(path.resolve()),
-            ReadOnly=True,
-            Untitled=False,
-            WithWindow=False,
-        )
-        lines: list[str] = []
-        slide_count = pres.Slides.Count
-        for i in range(1, slide_count + 1):
-            slide = pres.Slides(i)
-            for j in range(1, slide.Shapes.Count + 1):
-                try:
-                    shape = slide.Shapes(j)
-                    if shape.HasTextFrame:
-                        text = shape.TextFrame.TextRange.Text.strip()
-                        if text:
-                            lines.append(text)
-                except Exception:
-                    pass
-        pres.Close()
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            com_initialized = True
+        except Exception:
+            pass
+            
+        with ppt_lock:
+            ppt = win32com.client.Dispatch("PowerPoint.Application")
+            try:
+                ppt.Visible = False
+            except Exception:
+                pass
+            pres = ppt.Presentations.Open(
+                str(path.resolve()),
+                ReadOnly=True,
+                Untitled=False,
+                WithWindow=False,
+            )
+            lines: list[str] = []
+            slide_count = pres.Slides.Count
+            for i in range(1, slide_count + 1):
+                slide = pres.Slides(i)
+                for j in range(1, slide.Shapes.Count + 1):
+                    try:
+                         shape = slide.Shapes(j)
+                         if shape.HasTextFrame:
+                             text = shape.TextFrame.TextRange.Text.strip()
+                             if text:
+                                 lines.append(text)
+                    except Exception:
+                        pass
+            pres.Close()
+            
         combined = "\n".join(lines).strip()
         if not combined:
             return ExtractionResult(
@@ -137,6 +152,13 @@ def _extract_pptx_via_com(path: Path, max_chars: int, fallback_error: str) -> Ex
     finally:
         if ppt is not None:
             try:
-                ppt.Quit()
+                with ppt_lock:
+                    ppt.Quit()
+            except Exception:
+                pass
+        if com_initialized:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
             except Exception:
                 pass

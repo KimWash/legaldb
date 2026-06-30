@@ -20,10 +20,13 @@ if str(CURRENT_DIR) not in sys.path:
 
 from config_loader import ensure_directories, load_config, resolve_project_path
 from excel_writer import read_review_rows, write_review_workbook
+from extractor_doc import extract_doc
 from extractor_docx import extract_docx
 from extractor_eml import extract_eml
+from extractor_hwp import extract_hwp
 from extractor_image import extract_image
 from extractor_pdf import extract_pdf
+from extractor_ppt import extract_ppt
 from extractor_pptx import extract_pptx
 from extractor_xlsx import extract_xlsx
 from llm_client import OllamaClient
@@ -39,7 +42,7 @@ SUMMARY_SIGNAL_PATTERN = re.compile(
     r"계약|합의|소송|중재|의견|보고|통지|결의|증명|등기|양해각서|수정계약서)",
     re.IGNORECASE,
 )
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 11
 
 _LEGAL_META_KEYS = [
     "case_name_normalized", "case_alias", "case_type", "dispute_type",
@@ -222,9 +225,19 @@ def _build_analysis_result(record, extraction: ExtractionResult, llm_result: dic
         return AnalysisRecord(record, extraction, naming, {})
     naming = propose_name(record, extraction, llm_result, config, llm_client=llm_client)
     if extraction.extraction_status == "manual_review_required":
-        naming.reason = "구 버전 문서 형식(.doc/.ppt)으로 수동 검토 또는 변환이 필요합니다."
+        ext = record.file_extension.lower()
+        if ext in (".hwp", ".hwpx"):
+            if any("Legacy HWP 3.0" in note for note in extraction.notes):
+                naming.reason = "구 버전 한글 문서 형식(HWP 3.0)으로 수동 검토 또는 변환이 필요합니다. (HWP 5.0/HWPX로 변환 요망)"
+            else:
+                naming.reason = "한글 문서 형식(.hwp/.hwpx)으로 수동 검토 또는 변환이 필요합니다. (DRM 또는 파일 손상)"
+        elif ext in (".doc", ".ppt"):
+            naming.reason = f"구 버전 문서 형식({ext})으로 수동 검토 또는 변환이 필요합니다. (DRM 또는 파일 손상)"
+        else:
+            naming.reason = f"수동 검토 또는 변환이 필요한 문서 형식({ext})입니다."
         naming.needs_manual_review = True
         naming.confidence = 0.0
+        print(f"[warning] {record.original_file_name} is flagged for manual review: {naming.reason}")
     legal_metadata = _extract_legal_metadata(llm_result)
     return AnalysisRecord(record, extraction, naming, legal_metadata)
 
@@ -357,11 +370,7 @@ def _analyze_single_record_inner(
     elif record.file_extension == ".pptx":
         extraction = extract_pptx(path, max_chars=extract_max_chars)
     elif record.file_extension == ".ppt":
-        extraction = ExtractionResult(
-            file_type="ppt",
-            extraction_status="manual_review_required",
-            notes=["Legacy .ppt file requires external conversion or manual review."],
-        )
+        extraction = extract_ppt(path, max_chars=extract_max_chars)
     elif record.file_extension in (".jpg", ".jpeg", ".tif", ".tiff"):
         with ocr_semaphore:
             extraction = extract_image(path, config, max_chars=extract_max_chars)
@@ -369,11 +378,15 @@ def _analyze_single_record_inner(
         extraction = extract_xlsx(path, max_chars=extract_max_chars)
     elif record.file_extension == ".eml":
         extraction = extract_eml(path, max_chars=extract_max_chars)
+    elif record.file_extension in (".hwp", ".hwpx"):
+        extraction = extract_hwp(path, max_chars=extract_max_chars)
+    elif record.file_extension == ".doc":
+        extraction = extract_doc(path, max_chars=extract_max_chars)
     else:
         extraction = ExtractionResult(
-            file_type="doc",
-            extraction_status="manual_review_required",
-            notes=["Legacy .doc file requires external conversion or manual review."],
+            file_type=record.file_extension.lstrip(".") or "file",
+            extraction_status="unsupported",
+            notes=["Unsupported file format."],
         )
 
     llm_result = None

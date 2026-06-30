@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from collections import Counter
@@ -34,6 +34,7 @@ DATE_PATTERNS_YEAR_MONTH = [
     re.compile(r"\b(\d{2})[.\-/\s]+" + _MM + r"\b"),
 ]
 DOC_TYPE_KEYWORDS = [
+    "소송진행현황", "진행현황", "소송진행",
     # 새 8분류 (LLM이 반환하는 값과 일치)
     "소송진행보고", "심리결과보고", "법원명령", "상대방서면", "증거서류", "법률의견", "계약서", "통지서",
     # 기존 세부 유형 (fallback infer_doc_type용)
@@ -97,6 +98,9 @@ KEYWORD_POSITIVE_PATTERN = re.compile(
 )
 DOC_TYPE_TITLE_MAP = {
     # CSV(그룹,키워드 조합) 분류 — 명확히 일치할 때만 사용 (기타문서 대상이라 느슨 적용)
+    "소송진행현황": "소송진행보고",
+    "진행현황": "소송진행보고",
+    "소송진행": "소송진행보고",
     "소장": "소장",
     "답변서": "답변서",
     "준비서면": "준비서면",
@@ -768,14 +772,19 @@ def _keyword_supported_by_text(keyword: str, text: str) -> bool:
     return hits >= max(1, len(parts) // 2)
 
 
-def build_filename(prefix: str, document_title: str, original_title: str, document_date: str, revision_note: str, extension: str) -> str:
-    """패턴: {조직_프로젝트명(접두 보존)}_{문서제목}[_원문제목][_날짜][_특이사항].ext
+def build_filename(prefix: str, document_title: str, original_title: str, document_date: str, revision_note: str, extension: str, institution: str = "") -> str:
+    """패턴: {조직_프로젝트명(접두 보존)}_{(발송기관명)문서제목}[_원문제목][_날짜][_특이사항].ext
 
     prefix 는 split_existing_prefix 로 보존한 '조직_프로젝트명' 접두이다.
     날짜를 모르면 'date_unknown'을 붙이지 않고 슬롯 자체를 생략한다.
-    institution·keyword·summary 는 파일명에 포함하지 않는다.
     """
-    parts = [prefix, document_title or "문서"]
+    inst_clean = sanitize_filename_component(institution)
+    if inst_clean and inst_clean != "법무실":
+        doc_title_part = f"({inst_clean}){document_title or '문서'}"
+    else:
+        doc_title_part = document_title or "문서"
+
+    parts = [prefix, doc_title_part]
     if original_title:
         parts.append(original_title)
     # 날짜는 있을 때만 추가 (없으면 date_unknown 대신 생략)
@@ -805,22 +814,50 @@ def _extraction_status_label(status: str) -> str:
     return f"추출 실패 ({status})"
 
 
+def _ends_with_yymmdd(filename: str) -> bool:
+    if not filename:
+        return False
+    stem = Path(filename).stem
+    match = re.search(r"_(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$", stem)
+    if not match:
+        return False
+    yy, mm, dd = match.groups()
+    try:
+        year = _normalize_two_digit_year(yy)
+        datetime(year, int(mm), int(dd))
+        return True
+    except ValueError:
+        return False
+
+
 def evaluate_manual_review(extraction: ExtractionResult, result: NamingResult, threshold: float) -> tuple[bool, str]:
     if extraction.extraction_status != "success":
         return True, _extraction_status_label(extraction.extraction_status)
     if extraction.ocr_quality_low:
         return True, "OCR 품질 낮음"
-    if not result.extracted_doc_type:
-        return True, "문서 유형 미확인"
+    # if not result.extracted_doc_type:
+    #     return True, "문서 유형 미확인"
     if not result.extracted_document_title:
         return True, "문서 제목 미확인"
-    if result.extracted_date == "date_unknown":
+    
+    # original_file_name이 _yymmdd로 끝나면 날짜 미확인 검사를 건너뜀
+    ends_with_yymmdd = _ends_with_yymmdd(result.rollback_name)
+    if result.extracted_date == "date_unknown" and not ends_with_yymmdd:
         return True, "날짜 미확인"
     if result.confidence < threshold:
         return True, f"신뢰도 미달 ({round(result.confidence * 100)}% < {round(threshold * 100)}%)"
     if result.conflict_detected:
         return True, "파일명 중복"
     return False, ""
+
+
+def _is_generic_doc_type_word(title: str) -> bool:
+    compact = re.sub(r"\s+", "", title or "").lower()
+    for kw in DOC_TYPE_KEYWORDS:
+        kw_compact = re.sub(r"\s+", "", kw).lower()
+        if compact == kw_compact:
+            return True
+    return False
 
 
 def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_result: dict | None, config: dict, llm_client=None) -> NamingResult:
@@ -831,28 +868,36 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
     folder_hint = _folder_title_hint(file_record)
     doctype_fallback_source = f"{file_record.original_file_name} {folder_hint}".strip()
     doc_type = sanitize_filename_component(str((llm_result or {}).get("doc_type") or infer_doc_type(extraction.text_excerpt, doctype_fallback_source)))
+    if not doc_type:
+        doc_type = "기타"
     # 사건명은 항상 폴더 구조에서 가져온다 (LLM 결과 무시)
     case_name = infer_case_name(file_record)
     institution = sanitize_filename_component(str((llm_result or {}).get("institution_or_lawfirm") or infer_institution(extraction.text_excerpt, file_record.original_file_name)))
     # 날짜: LLM 결과 우선, YYYYMMDD 등 비정상 포맷은 YYMMDD로 정규화
-    filename_date = normalize_date(file_record.original_file_name)
-    llm_date_raw = str((llm_result or {}).get("document_date") or "").strip()
-    if llm_date_raw:
-        extracted_date = sanitize_filename_component(_normalize_llm_date(llm_date_raw))
-        # LLM 날짜와 파일명 날짜 연도 차이가 5년 초과이면 파일명 날짜를 신뢰
-        # (LLM이 본문의 오래된 참조 날짜를 발행일로 잘못 읽는 케이스 방어)
-        if (
-            extracted_date and extracted_date != "date_unknown"
-            and filename_date and filename_date != "date_unknown"
-        ):
-            llm_yr = _yymmdd_to_year(extracted_date)
-            fn_yr = _yymmdd_to_year(filename_date)
-            if llm_yr and fn_yr and abs(llm_yr - fn_yr) > 5:
-                extracted_date = filename_date
+    # 단, 파일명이 _yymmdd로 끝나는 경우 날짜 탐지(본문/LLM)를 건너뛰고 기존 파일명의 날짜를 그대로 유지
+    stem = Path(file_record.original_file_name).stem
+    match_yymmdd = re.search(r"_(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$", stem)
+    if match_yymmdd:
+        extracted_date = stem[match_yymmdd.start() + 1:]
     else:
-        extracted_date = sanitize_filename_component(normalize_date(f"{file_record.original_file_name}\n{extraction.text_excerpt}"))
-    if not extracted_date:
-        extracted_date = "date_unknown"
+        filename_date = normalize_date(file_record.original_file_name)
+        llm_date_raw = str((llm_result or {}).get("document_date") or "").strip()
+        if llm_date_raw:
+            extracted_date = sanitize_filename_component(_normalize_llm_date(llm_date_raw))
+            # LLM 날짜와 파일명 날짜 연도 차이가 5년 초과이면 파일명 날짜를 신뢰
+            # (LLM이 본문의 오래된 참조 날짜를 발행일로 잘못 읽는 케이스 방어)
+            if (
+                extracted_date and extracted_date != "date_unknown"
+                and filename_date and filename_date != "date_unknown"
+            ):
+                llm_yr = _yymmdd_to_year(extracted_date)
+                fn_yr = _yymmdd_to_year(filename_date)
+                if llm_yr and fn_yr and abs(llm_yr - fn_yr) > 5:
+                    extracted_date = filename_date
+        else:
+            extracted_date = sanitize_filename_component(normalize_date(f"{file_record.original_file_name}\n{extraction.text_excerpt}"))
+        if not extracted_date:
+            extracted_date = "date_unknown"
 
     keyword_source_text = extraction.extracted_text or extraction.text_excerpt
     llm_keyword = _normalize_keyword_token(str((llm_result or {}).get("english_keyword") or ""))
@@ -914,23 +959,29 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
 
     llm_title = sanitize_filename_component(str((llm_result or {}).get("document_title") or ""))
     mapped_title = _mapped_doc_title(doc_type)
-    # 기타문서 대상 — LLM의 구체적 문서명을 최대한 보존 (모호·포괄 표현만 배제, 느슨 적용)
+    tail_title = _clean_title_tail(original_tail)
+    
+    # 1. LLM이 구체적으로 분석한 제목이 있으면 사용
     if llm_title and not _is_vague_title(llm_title):
         document_title = llm_title[:30]
+    # 2. 분류 매핑 제목 사용 (분류 라벨이 명확히 일치하는 경우 우선 적용)
     elif mapped_title:
         document_title = mapped_title
+    # 3. 원본 파일명에서 정제된 구체적 이름이 있고, 그것이 단순 분류명이 아닌 경우 보존
+    elif tail_title and not _is_vague_title(tail_title) and not _is_generic_doc_type_word(tail_title):
+        document_title = tail_title
+    # 4. 분류명이 없거나 단순 분류명이라도 일단 원본 파일명의 일반 제목 사용
+    elif tail_title and not _is_vague_title(tail_title):
+        document_title = tail_title
+    # 5. 최종 폴백
     else:
-        # LLM 제목이 없을 때(또는 LLM 호출 실패): 기타문서이므로 '문서 고유명' = 원본 파일명 tail을 우선 사용.
         document_title = ""
         if llm_client is not None and summary:
             generated = llm_client.generate_short_title(summary)
             if generated and not _is_vague_title(generated):
                 document_title = _normalize_document_title(generated, max_chars=12)
         if not document_title:
-            tail_title = _clean_title_tail(original_tail)
-            if tail_title:
-                document_title = tail_title
-            elif folder_hint:
+            if folder_hint:
                 # 파일명 tail이 비면 위치한 폴더명을 문서명 힌트로 사용
                 document_title = folder_hint
             else:
@@ -969,6 +1020,7 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
         document_date=result.extracted_date,
         revision_note=result.revision_note,
         extension=file_record.file_extension,
+        institution=result.extracted_institution,
     )
     if len(result.suggested_file_name) > max_filename_length:
         stem = Path(result.suggested_file_name).stem[: max_filename_length - len(file_record.file_extension)]
@@ -976,12 +1028,12 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
         result.reason = f"{result.reason} 파일명 길이를 제한에 맞게 잘랐습니다.".strip()
         result.confidence = min(result.confidence, 0.8)
     result.suggested_full_path = build_suggested_path(file_record.original_dir_path, result.suggested_file_name)
+    result.rollback_name = file_record.original_file_name
     needs_review, review_reason = evaluate_manual_review(extraction, result, threshold)
     result.needs_manual_review = needs_review
     if needs_review and review_reason:
         reason_prefix = result.reason.strip()
         result.reason = f"{reason_prefix} [{review_reason}]".strip() if reason_prefix else f"[{review_reason}]"
-    result.rollback_name = file_record.original_file_name
     return result
 
 

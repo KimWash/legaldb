@@ -37,6 +37,8 @@ def extract_docx(path: Path, max_chars: int = 8000) -> ExtractionResult:
         return _extract_docx_via_com(path, max_chars, fallback_error=str(exc))
 
 
+from com_lock import word_lock
+
 def _extract_docx_via_com(path: Path, max_chars: int, fallback_error: str) -> ExtractionResult:
     """MIP-보호 DOCX를 Word COM으로 열어 텍스트 추출."""
     try:
@@ -49,14 +51,32 @@ def _extract_docx_via_com(path: Path, max_chars: int, fallback_error: str) -> Ex
         )
 
     word = None
+    com_initialized = False
     try:
-        word = win32com.client.Dispatch("Word.Application")
-        word.Visible = False
-        doc = word.Documents.Open(str(path.resolve()), ReadOnly=True)
-        # Range().Text는 단락, 표 셀, 머리글/바닥글 포함 전체 텍스트 반환
-        # Word는 줄바꿈에 \r을 사용하므로 \n으로 정규화
-        raw = doc.Range().Text
-        doc.Close(False)
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            com_initialized = True
+        except Exception:
+            pass
+            
+        with word_lock:
+            word = win32com.client.Dispatch("Word.Application")
+            try:
+                word.Visible = False
+            except Exception:
+                pass
+            try:
+                word.DisplayAlerts = 0
+            except Exception:
+                pass
+            
+            doc = word.Documents.Open(str(path.resolve()), ReadOnly=True)
+            # Range().Text는 단락, 표 셀, 머리글/바닥글 포함 전체 텍스트 반환
+            # Word는 줄바꿈에 \r을 사용하므로 \n으로 정규화
+            raw = doc.Range().Text
+            doc.Close(False)
+            
         combined = raw.replace("\r", "\n").strip()
         if not combined:
             return ExtractionResult(
@@ -80,6 +100,13 @@ def _extract_docx_via_com(path: Path, max_chars: int, fallback_error: str) -> Ex
     finally:
         if word is not None:
             try:
-                word.Quit()
+                with word_lock:
+                    word.Quit()
+            except Exception:
+                pass
+        if com_initialized:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
             except Exception:
                 pass

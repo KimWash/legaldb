@@ -66,6 +66,14 @@
 > 실행 로그에 `[ocr_accelerated] engine ready backend=... device=GPU` 가 보이면 가속이 활성화된 것입니다.
 > `unavailable` 메시지가 보이면 Tesseract로 폴백되며 결과 품질에는 영향이 없습니다.
 
+### 1-6. 구 버전 및 한글 문서 파일 추출 사전 요구사항
+
+1. **Microsoft Office (Word & PowerPoint)**:
+   - 구 버전 문서 형식(`.doc`, `.ppt`)의 텍스트 추출은 Windows COM 자동화를 사용하므로 PC에 Microsoft Word 및 PowerPoint 프로그램이 정식 설치되어 있어야 합니다.
+   - DRM(MIP 등)이 걸리지 않은 일반 파일만 자동으로 추출할 수 있으며, DRM이 적용된 파일은 자동으로 수동 검토 대상으로 전환됩니다.
+2. **olefile 라이브러리**:
+   - 한글 파일(`.hwp`) 구조 분석을 위해 `olefile` 라이브러리가 사용되며, `requirements.txt`에 등록되어 있습니다.
+
 ---
 
 ## 2. 프로젝트 파일 복사
@@ -95,7 +103,7 @@ pip install ocrmypdf
 
 설치 확인:
 ```
-pip show fastapi openpyxl pytesseract ocrmypdf
+pip show fastapi openpyxl pytesseract ocrmypdf olefile
 ```
 
 ---

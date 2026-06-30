@@ -13,6 +13,8 @@ supported_extensions:
   - ".tif"
   - ".tiff"
   - ".eml"
+  - ".hwp"
+  - ".hwpx"
 exclude_extensions:
   - ".png"
   - ".html"
@@ -22,7 +24,7 @@ llm:
   temperature: 0.1
   timeout_seconds: 90
   gemini:
-    model: "gemini-2.5-flash"
+    model: "gemini-2.5-flash-lite"
     base_url: "https://generativelanguage.googleapis.com/v1beta"
     api_key: ""   # 비우면 .env의 GEMINI_API_KEY (또는 GOOGLE_API_KEY) 사용
 ocr:
@@ -83,8 +85,8 @@ sharepoint:
   folder_sharing_url: "https://poscointl1.sharepoint.com/:f:/s/DX-DB/IgCQAQRjHIk0SbBnci9HWhCRAU_vHspdPVUezfWf_qfKBwI?e=wu11cv"
 performance:
   workers: 6
-  ocr_workers: 4
-  llm_workers: 4
+  ocr_workers: 6
+  llm_workers: 6
   progress_every: 10
   heartbeat_seconds: 30
   max_files: 0

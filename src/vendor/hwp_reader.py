@@ -25,9 +25,7 @@ from pathlib import Path
 try:
     import olefile
 except ImportError:
-    print("olefile 라이브러리가 필요합니다. 설치해주세요:")
-    print("  pip install olefile")
-    sys.exit(1)
+    olefile = None
 
 
 class HWPReader:
@@ -78,6 +76,8 @@ class HWPReader:
 
     def open(self):
         """HWP 파일 열기"""
+        if olefile is None:
+            raise ImportError("olefile 라이브러리가 필요합니다. 설치해주세요: pip install olefile")
         self.ole = olefile.OleFileIO(str(self.file_path))
 
         # FileHeader에서 압축 여부 확인

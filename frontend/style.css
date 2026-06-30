@@ -831,6 +831,7 @@ details[open] > summary .tree-chevron { transform: rotate(90deg); }
 .a-stat-val--blue  { color: var(--navy-800); }
 .a-stat-val--amber { color: var(--amber-700); }
 .a-stat-val--red   { color: #dc2626; }
+.a-stat-val--green { color: var(--green-700); }
 .a-stat-lbl { font-size: .68rem; color: var(--slate-400); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin-top: 2px; }
 
 /* ── Active Files ───────────────────────────────────────────────────── */

@@ -129,21 +129,36 @@ def _read_via_win32com(review_file: Path) -> list[dict]:
     MIP 정책이 임시 파일에 재적용되는 문제를 피할 수 있다.
     """
     import win32com.client  # type: ignore
-
-    excel = win32com.client.Dispatch("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
+    com_initialized = False
+    excel = None
     try:
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            com_initialized = True
+        except Exception:
+            pass
+            
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
         wb = excel.Workbooks.Open(str(review_file.resolve()))
         ws = wb.Worksheets(1)
         used = ws.UsedRange
         data = used.Value  # tuple of tuples (row, col)
         wb.Close(False)
     finally:
-        try:
-            excel.Quit()
-        except Exception:
-            pass
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+        if com_initialized:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     if not data:
         return []

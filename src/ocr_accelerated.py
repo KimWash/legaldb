@@ -30,6 +30,7 @@ from ocr_advanced import (
 
 # 엔진은 프로세스당 1회만 생성 (모델 로드 비용이 크므로 캐시)
 _ENGINE_LOCK = threading.Lock()
+_INFERENCE_LOCK = threading.Lock()  # OpenVINO InferRequest is not thread-safe; serialize execution.
 _ENGINE_STATE: dict | None = None  # {"engine", "device", "backend"} or {"engine": None, ...}
 
 
@@ -96,7 +97,7 @@ def _get_engine(config: dict):
         lang = str(config.get("lang", "korean"))
         built = _try_build_rapidocr(device_priority, lang) or _try_build_rapidocr_openvino(device_priority)
         if built is None:
-            print("[ocr_accelerated] RapidOCR/OpenVINO unavailable — falling back to Tesseract pipeline.")
+            print("[ocr_accelerated] RapidOCR/OpenVINO unavailable - falling back to Tesseract pipeline.")
             _ENGINE_STATE = {"engine": None, "device": "", "backend": "unavailable"}
         else:
             engine, device, backend = built
@@ -113,7 +114,8 @@ def is_available(config: dict) -> bool:
 
 def _run_engine_on_image(engine, image) -> tuple[str, float]:
     """Run RapidOCR on a BGR/RGB numpy image. Returns (text, mean_conf_0_100)."""
-    output = engine(image)
+    with _INFERENCE_LOCK:
+        output = engine(image)
     # rapidocr_openvino: returns (result, elapse); result = [[box, text, score], ...] or None
     # rapidocr 2.x: returns an object with .txts / .scores
     texts: list[str] = []

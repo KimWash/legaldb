@@ -4,6 +4,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 import hashlib
 import json
+import shutil
 import statistics
 import subprocess
 import time
@@ -43,43 +44,82 @@ def _ensure_dirs(base: Path) -> dict[str, Path]:
 def _get_pdf_page_count(pdf_path: Path) -> int:
     import pypdfium2 as pdfium
     doc = pdfium.PdfDocument(str(pdf_path))
-    return len(doc)
+    try:
+        return len(doc)
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
 
 
 def _iter_pdf_pages(pdf_path: Path, dpi: int) -> Iterator[tuple[int, object]]:
-    """Lazily yield (page_no, bgr_image) one page at a time to avoid loading all pages into memory."""
+    """Lazily yield (page_no, bgr_image) one page at a time to avoid loading all pages into memory.
+
+    doc.close() is guaranteed via try/finally even when the caller breaks early or
+    an exception is raised, preventing "IO Operation on closed file" in multi-threaded use.
+    Per-page objects are explicitly deleted to release memory promptly.
+    """
     import pypdfium2 as pdfium
     import cv2
     import numpy as np
 
     scale = dpi / 72.0
     doc = pdfium.PdfDocument(str(pdf_path))
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        pil_img = page.render(scale=scale).to_pil().convert("RGB")
-        rgb = np.array(pil_img)
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        yield (page_index + 1, bgr)
+    try:
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            render_pil = page.render(scale=scale).to_pil()
+            pil_img = render_pil.convert("RGB")
+            rgb = np.array(pil_img)
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            yield (page_index + 1, bgr)
+            
+            # Explicitly close PIL images to release backend C-buffers immediately
+            try:
+                render_pil.close()
+                pil_img.close()
+            except Exception:
+                pass
+                
+            # Explicitly release per-page objects to avoid memory accumulation
+            del page, render_pil, pil_img, rgb, bgr
+    finally:
+        # Guaranteed cleanup even on break, timeout, or exception
+        try:
+            doc.close()
+        except Exception:
+            pass
 
 
 def _preprocess_image(image):
     import cv2
     import numpy as np
 
+    # Minimize image copies by working in-place as much as possible
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    contrast = cv2.convertScaleAbs(gray, alpha=1.6, beta=8)
-    thresholded = cv2.adaptiveThreshold(
-        contrast,
+    del image  # Release original image reference immediately
+
+    cv2.convertScaleAbs(gray, dst=gray, alpha=1.6, beta=8)
+    cv2.adaptiveThreshold(
+        gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
         31,
         12,
+        dst=gray
     )
-    denoised = cv2.fastNlMeansDenoising(thresholded, h=15, templateWindowSize=7, searchWindowSize=21)
+    
+    denoised = cv2.fastNlMeansDenoising(gray, h=15, templateWindowSize=7, searchWindowSize=21)
+    del gray  # Release gray buffer immediately
+
     sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
-    sharpened = cv2.filter2D(denoised, -1, sharpen_kernel)
-    padded = cv2.copyMakeBorder(sharpened, 24, 24, 24, 24, cv2.BORDER_CONSTANT, value=255)
+    cv2.filter2D(denoised, -1, sharpen_kernel, dst=denoised)
+    
+    padded = cv2.copyMakeBorder(denoised, 24, 24, 24, 24, cv2.BORDER_CONSTANT, value=255)
+    del denoised  # Release denoised buffer immediately
+    
     return padded
 
 
@@ -148,7 +188,9 @@ def _choose_best_text(preprocessed, min_len: int, lang: str):
         (crop6, cconf6, 6, True, cropped),
         (crop11, cconf11, 11, True, cropped),
     ]
-    return max(candidates, key=lambda item: (len(item[0]), item[1]))
+    best = max(candidates, key=lambda item: (len(item[0]), item[1]))
+    del candidates  # Release references in the candidates list
+    return best
 
 
 def _resolve_tesseract_cmd(config: dict) -> str:
@@ -229,6 +271,12 @@ def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_secon
                 text_file=str(txt_path),
             )
         )
+        
+        # Release local references immediately at end of loop to allow early garbage collection
+        try:
+            del image, preprocessed, used_img
+        except Exception:
+            pass
 
     merged_text = "\n\n".join(merged_parts).strip() if merged_parts else "__NO_TEXT__"
     merged_path = dirs["base"] / "merged.txt"
@@ -241,6 +289,17 @@ def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_secon
         final_status = "timeout_partial" if merged_text != "__NO_TEXT__" else "timeout_no_text"
     else:
         final_status = "success" if merged_text != "__NO_TEXT__" else "no_text"
+
+    # ── 임시 파일 정리 (대용량 rendered/processed PNG 삭제) ────────────────────────
+    # save_debug_images=True 이면 보존, False(기본) + cleanup_after_ocr=True 이면 삭제
+    cleanup_enabled = bool(config.get("cleanup_after_ocr", True))
+    if cleanup_enabled and not save_debug_images:
+        for _subdir in ("rendered", "processed", "page_txt"):
+            try:
+                shutil.rmtree(dirs[_subdir], ignore_errors=True)
+            except Exception:
+                pass
+        print(f"[ocr_advanced] 임시 이미지 정리 완료: {run_dir}")
 
     summary = {
         "pdf_path": str(pdf_path),

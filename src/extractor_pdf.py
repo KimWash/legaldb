@@ -6,6 +6,7 @@ import io
 import os
 import re
 import sys
+import time
 import warnings
 
 from models import ExtractionResult
@@ -115,10 +116,17 @@ def _extract_with_ocrmypdf(path: Path, config: dict, temp_dir: Path, max_chars: 
             notes=["OCRmyPDF attempted but failed."],
         )
     ocr_text, ocr_page_count = _read_pdf_text(ocr_output, max_chars=max_chars)
-    try:
-        ocr_output.unlink(missing_ok=True)
-    except Exception:
-        pass
+    # Windows 파일 잠금 대응: 삭제 실패 시 최대 5회 재시도 (100ms 간격)
+    _max_retries = 5
+    for _attempt in range(_max_retries):
+        try:
+            ocr_output.unlink(missing_ok=True)
+            break
+        except (PermissionError, OSError) as _e:
+            if _attempt < _max_retries - 1:
+                time.sleep(0.1)
+            else:
+                print(f"[extractor_pdf] 임시 파일 삭제 최종 실패 (무시): {ocr_output} - {_e}")
     norm = re.sub(r"\s+", "", ocr_text or "")
     threshold = int(config["ocr"].get("force_ocr_threshold_chars", 80))
     return ExtractionResult(

@@ -5,6 +5,30 @@ import argparse
 from dataclasses import asdict
 import hashlib
 import json
+
+# ── Global surrogate cleaning patch for JSON serialization ───────────────────
+def clean_surrogates(val):
+    if isinstance(val, str):
+        return "".join(c if not (0xD800 <= ord(c) <= 0xDFFF) else "\uFFFD" for c in val)
+    elif isinstance(val, dict):
+        return {clean_surrogates(k): clean_surrogates(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [clean_surrogates(x) for x in val]
+    elif isinstance(val, tuple):
+        return tuple(clean_surrogates(x) for x in val)
+    elif isinstance(val, set):
+        return {clean_surrogates(x) for x in val}
+    return val
+
+_original_dumps = json.dumps
+def _safe_dumps(obj, *args, **kwargs):
+    try:
+        cleaned = clean_surrogates(obj)
+    except Exception:
+        cleaned = obj
+    return _original_dumps(cleaned, *args, **kwargs)
+json.dumps = _safe_dumps
+# ─────────────────────────────────────────────────────────────────────────────
 import os
 import re
 import sys
@@ -222,23 +246,42 @@ def _build_analysis_result(record, extraction: ExtractionResult, llm_result: dic
             rename_status="out_of_scope",
             rollback_name=record.original_file_name,
         )
-        return AnalysisRecord(record, extraction, naming, {})
-    naming = propose_name(record, extraction, llm_result, config, llm_client=llm_client)
-    if extraction.extraction_status == "manual_review_required":
-        ext = record.file_extension.lower()
-        if ext in (".hwp", ".hwpx"):
-            if any("Legacy HWP 3.0" in note for note in extraction.notes):
-                naming.reason = "구 버전 한글 문서 형식(HWP 3.0)으로 수동 검토 또는 변환이 필요합니다. (HWP 5.0/HWPX로 변환 요망)"
+    else:
+        naming = propose_name(record, extraction, llm_result, config, llm_client=llm_client)
+        if extraction.extraction_status == "manual_review_required":
+            ext = record.file_extension.lower()
+            if ext in (".hwp", ".hwpx"):
+                if any("Legacy HWP 3.0" in note for note in extraction.notes):
+                    naming.reason = "구 버전 한글 문서 형식(HWP 3.0)으로 수동 검토 또는 변환이 필요합니다. (HWP 5.0/HWPX로 변환 요망)"
+                else:
+                    naming.reason = "한글 문서 형식(.hwp/.hwpx)으로 수동 검토 또는 변환이 필요합니다. (DRM 또는 파일 손상)"
+            elif ext in (".doc", ".ppt"):
+                naming.reason = f"구 버전 문서 형식({ext})으로 수동 검토 또는 변환이 필요합니다. (DRM 또는 파일 손상)"
             else:
-                naming.reason = "한글 문서 형식(.hwp/.hwpx)으로 수동 검토 또는 변환이 필요합니다. (DRM 또는 파일 손상)"
-        elif ext in (".doc", ".ppt"):
-            naming.reason = f"구 버전 문서 형식({ext})으로 수동 검토 또는 변환이 필요합니다. (DRM 또는 파일 손상)"
-        else:
-            naming.reason = f"수동 검토 또는 변환이 필요한 문서 형식({ext})입니다."
-        naming.needs_manual_review = True
-        naming.confidence = 0.0
-        print(f"[warning] {record.original_file_name} is flagged for manual review: {naming.reason}")
+                naming.reason = f"수동 검토 또는 변환이 필요한 문서 형식({ext})입니다."
+            naming.needs_manual_review = True
+            naming.confidence = 0.0
+            print(f"[warning] {record.original_file_name} is flagged for manual review: {naming.reason}")
+
     legal_metadata = _extract_legal_metadata(llm_result)
+
+    # Clean any surrogate characters to prevent UnicodeEncodeError in Excel/CSV/JSON serialization
+    for field_name in record.__dataclass_fields__:
+        val = getattr(record, field_name)
+        if isinstance(val, str):
+            setattr(record, field_name, clean_surrogates(val))
+    for field_name in extraction.__dataclass_fields__:
+        val = getattr(extraction, field_name)
+        if isinstance(val, str):
+            setattr(extraction, field_name, clean_surrogates(val))
+        elif isinstance(val, list):
+            setattr(extraction, field_name, clean_surrogates(val))
+    for field_name in naming.__dataclass_fields__:
+        val = getattr(naming, field_name)
+        if isinstance(val, str):
+            setattr(naming, field_name, clean_surrogates(val))
+    legal_metadata = clean_surrogates(legal_metadata)
+
     return AnalysisRecord(record, extraction, naming, legal_metadata)
 
 
@@ -500,9 +543,16 @@ def analyze(
     sp_semaphore = BoundedSemaphore(max(1, perf["workers"])) if sp_client else None
     active_files: dict[int, str] = {}  # thread_id → filename (GIL로 thread-safe)
 
+    # Use a sliding window to limit active Futures in the executor queue (Backpressure)
+    max_active = max(1, perf["workers"] * 2)
+    uncached_iter = iter(uncached_records)
+    future_to_record = {}
+    pending = set()
+
     with ThreadPoolExecutor(max_workers=perf["workers"]) as executor:
-        future_to_record = {
-            executor.submit(
+        # Initial fill
+        for record_and_key in uncached_iter:
+            f = executor.submit(
                 _analyze_single_record,
                 record_and_key[0],
                 runtime_config,
@@ -517,30 +567,18 @@ def analyze(
                 sp_client,
                 sp_semaphore,
                 active_files,
-            ): record_and_key[0]
-            for record_and_key in uncached_records
-        }
+            )
+            future_to_record[f] = record_and_key[0]
+            pending.add(f)
+            if len(pending) >= max_active:
+                break
 
-        pending = set(future_to_record.keys())
         last_heartbeat = time.monotonic()
 
         while pending:
             done, pending = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
 
-            if not done:
-                now = time.monotonic()
-                if now - last_heartbeat >= perf["heartbeat_seconds"]:
-                    timing = _build_timing_suffix(start_ts, processed_count, total_count)
-                    currently = list(active_files.values())
-                    active_str = ", ".join(currently) if currently else "-"
-                    print(
-                        f"[analyze] heartbeat completed={processed_count}/{total_count} "
-                        f"pending={len(pending)} {timing}\n"
-                        f"          active: {active_str}"
-                    )
-                    last_heartbeat = now
-                continue
-
+            # Process completed tasks
             for future in done:
                 record = future_to_record[future]
                 try:
@@ -578,6 +616,47 @@ def analyze(
                         f"[analyze] progress {processed_count}/{total_count} ({progress:.1f}%) "
                         f"manual_review={manual_review_count} cache_hits={cache_hit_count} {timing}"
                     )
+                
+                # Explicitly clean up completed future references
+                del future_to_record[future]
+
+            # Refill the window
+            while len(pending) < max_active:
+                try:
+                    record_and_key = next(uncached_iter)
+                except StopIteration:
+                    break
+                f = executor.submit(
+                    _analyze_single_record,
+                    record_and_key[0],
+                    runtime_config,
+                    temp_dir,
+                    llm,
+                    bool(runtime_config["llm"].get("enabled", True)),
+                    perf["llm_excerpt_chars"],
+                    perf["extract_max_chars"],
+                    record_and_key[1],
+                    ocr_semaphore,
+                    llm_semaphore,
+                    sp_client,
+                    sp_semaphore,
+                    active_files,
+                )
+                future_to_record[f] = record_and_key[0]
+                pending.add(f)
+
+            if not done:
+                now = time.monotonic()
+                if now - last_heartbeat >= perf["heartbeat_seconds"]:
+                    timing = _build_timing_suffix(start_ts, processed_count, total_count)
+                    currently = list(active_files.values())
+                    active_str = ", ".join(currently) if currently else "-"
+                    print(
+                        f"[analyze] heartbeat completed={processed_count}/{total_count} "
+                        f"pending={len(pending)} {timing}\n"
+                        f"          active: {active_str}"
+                    )
+                    last_heartbeat = now
 
     analysis_records.sort(key=lambda item: item.file_record.seq)
     if cache_enabled:

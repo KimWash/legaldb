@@ -41,7 +41,7 @@ ocr:
   accelerated:
     device_priority: ["GPU", "NPU", "CPU"]   # Arc GPU 우선 → NPU → CPU, 실패 시 다음으로 폴백
     lang: "korean"        # RapidOCR 인식 언어(한국어+영문)
-    dpi: 300
+    dpi: 200              # 300 -> 200 (메모리 절감)
     min_len: 40
     preprocess: false     # RapidOCR는 자체 전처리 포함 (true면 ocr_advanced 전처리 적용)
     timeout_seconds: 60
@@ -53,6 +53,8 @@ ocr:
     fallback_to_ocrmypdf: true
     tesseract_cmd: "C:/Program Files/Tesseract-OCR/tesseract.exe"
     timeout_seconds: 60   # 이 시간 초과 시 처리된 페이지까지만 사용 (0 = 무제한)
+    save_debug_images: false   # true로 바꾸면 rendered/processed PNG 보존 (디스크 많이 사용)
+    cleanup_after_ocr: true    # OCR 완료 후 rendered/processed/page_txt 자동 삭제
 review:
   output_dir: "./output/review"
 logs:
@@ -84,13 +86,14 @@ sharepoint:
   # drive_id: ""   # 선택사항: 테스트 실행 후 출력된 drive_id를 입력하면 Sites.Read.All 없이도 스캔 가능
   folder_sharing_url: "https://poscointl1.sharepoint.com/:f:/s/DX-DB/IgCQAQRjHIk0SbBnci9HWhCRAU_vHspdPVUezfWf_qfKBwI?e=wu11cv"
 performance:
-  workers: 6
-  ocr_workers: 6
-  llm_workers: 6
+  workers: 4              # 6 -> 4
+  ocr_workers: 4          # 6 -> 2
+  llm_workers: 4          # 6 -> 4
   progress_every: 10
   heartbeat_seconds: 30
   max_files: 0
-  extract_max_chars: 15000
-  llm_excerpt_chars: 5000
+  extract_max_chars: 8000  # 15000 -> 8000
+  llm_excerpt_chars: 4000  # 5000 -> 4000
   fast_disables_ocr: true
   fast_disables_llm: true
+  temp_cleanup_days: 1   # 분석 완료 후 이 일수 이상 된 ocr_runs 항목 자동 삭제 (0 = 안 정리)

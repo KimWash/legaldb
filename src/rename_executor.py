@@ -145,7 +145,10 @@ def execute_rename(
         for chunk_start in range(0, len(sp_pending), BATCH_SIZE):
             chunk = sp_pending[chunk_start: chunk_start + BATCH_SIZE]
 
-            batch_items = [
+            # chunk의 각 row에 대한 최종 결과를 담을 dict (key: item_id)
+            final_results_map: dict[str, dict] = {}
+            # 재시도해야 할 대기열
+            pending_items = [
                 {
                     "item_id": str(row.get("sharepoint_item_id") or "").strip(),
                     "new_name": Path(str(row.get("suggested_full_path") or "")).name,
@@ -156,74 +159,53 @@ def execute_rename(
             # 429 대응: 최대 3회 재시도
             max_retries = 3
             attempt = 0
-            batch_results: list[dict] = []
 
-            while attempt < max_retries:
+            while attempt < max_retries and pending_items:
                 attempt += 1
                 try:
-                    batch_results = sp_client.batch_rename_items(batch_items)
+                    current_results = sp_client.batch_rename_items(pending_items)
                 except Exception as exc:
                     # $batch POST 자체가 실패한 경우 (네트워크 오류 등)
                     print(f"[rename_executor] $batch 요청 실패 (시도 {attempt}/{max_retries}): {exc}")
                     if attempt >= max_retries:
-                        # 청크 전체를 실패 처리
-                        for row in chunk:
-                            original_path = Path(str(row.get("original_full_path") or ""))
-                            target_path = Path(str(row.get("suggested_full_path") or ""))
-                            sp_item_id = str(row.get("sharepoint_item_id") or "").strip()
-                            results.append({
-                                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                                "original_full_path": str(original_path),
-                                "new_full_path": str(target_path),
-                                "sharepoint_item_id": sp_item_id,
-                                "status": "rename_failed",
-                                "reason": f"$batch 요청 오류: {exc}",
-                            })
-                            if progress_callback:
-                                try:
-                                    progress_callback({
-                                        "original_full_path": str(original_path),
-                                        "new_full_path": str(target_path),
-                                        "status": "rename_failed",
-                                        "reason": f"$batch 요청 오류: {exc}",
-                                    })
-                                except Exception as cb_exc:
-                                    print(f"[rename_executor] Progress callback error: {cb_exc}")
+                        # 아직 처리되지 않은 남은 pending_items에 대해 전부 실패 기록
+                        for pi in pending_items:
+                            final_results_map[pi["item_id"]] = {
+                                "item_id": pi["item_id"],
+                                "new_name": pi["new_name"],
+                                "status": 0,
+                                "ok": False,
+                                "retry_after": None,
+                                "error": f"$batch 요청 오류: {exc}"
+                            }
                         break
                     time.sleep(5)
                     continue
 
-                # 429 가 있으면 retry_after 최댓값만큼 대기 후 해당 항목만 재시도
-                throttled = [r for r in batch_results if r["status"] == 429]
-                if throttled:
-                    wait_sec = max((r["retry_after"] or 10) for r in throttled)
-                    print(f"[rename_executor] 429 Throttled — {wait_sec}초 대기 후 재시도 ({len(throttled)}건)")
-                    time.sleep(wait_sec)
-                    # 실패한 항목만 재배치 (성공한 항목은 보존)
-                    ok_results = [r for r in batch_results if r["status"] != 429]
-                    retry_items = [
-                        {"item_id": r["item_id"], "new_name": r["new_name"]}
-                        for r in throttled
-                    ]
-                    try:
-                        retry_results = sp_client.batch_rename_items(retry_items)
-                        batch_results = ok_results + retry_results
-                    except Exception as retry_exc:
-                        print(f"[rename_executor] 재시도 실패: {retry_exc}")
-                        # 재시도 실패 항목도 error로 기록
-                        for r in throttled:
-                            r["ok"] = False
-                            r["error"] = f"재시도 실패: {retry_exc}"
-                        batch_results = ok_results + throttled
-                # 429 없으면 재시도 불필요
-                break
+                # 결과를 map에 저장하되, 429(Throttled)인 것은 다음 시도를 위해 pending_items로 남겨둠
+                next_pending = []
+                throttled_results = []
+                for r in current_results:
+                    if r["status"] == 429:
+                        throttled_results.append(r)
+                        next_pending.append({"item_id": r["item_id"], "new_name": r["new_name"]})
+                    else:
+                        final_results_map[r["item_id"]] = r
 
-            # 배치 결과를 results에 반영
-            for row, br in zip(chunk, batch_results):
+                pending_items = next_pending
+
+                if pending_items:
+                    wait_sec = max((r["retry_after"] or 10) for r in throttled_results)
+                    print(f"[rename_executor] 429 Throttled — {wait_sec}초 대기 후 재시도 ({len(pending_items)}건)")
+                    time.sleep(wait_sec)
+
+            # 배치 결과를 chunk 순서에 맞게 results에 반영
+            for row in chunk:
                 original_path = Path(str(row.get("original_full_path") or ""))
                 target_path = Path(str(row.get("suggested_full_path") or ""))
                 sp_item_id = str(row.get("sharepoint_item_id") or "").strip()
 
+                br = final_results_map.get(sp_item_id, {})
                 if br.get("ok"):
                     status = "success"
                     reason = "파일명 변경 완료 (SharePoint Batch)"
@@ -237,7 +219,7 @@ def execute_rename(
                     })
                 else:
                     status = "rename_failed"
-                    reason = br.get("error") or f"HTTP {br.get('status')}"
+                    reason = br.get("error") or f"HTTP {br.get('status', 0)}"
 
                 results.append({
                     "timestamp": datetime.now().isoformat(timespec="seconds"),

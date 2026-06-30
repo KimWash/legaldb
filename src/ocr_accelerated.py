@@ -15,6 +15,7 @@ from dataclasses import asdict
 from pathlib import Path
 import hashlib
 import json
+import shutil
 import statistics
 import threading
 import time
@@ -28,10 +29,21 @@ from ocr_advanced import (
     _preprocess_image,
 )
 
-# 엔진은 프로세스당 1회만 생성 (모델 로드 비용이 크므로 캐시)
-_ENGINE_LOCK = threading.Lock()
-_INFERENCE_LOCK = threading.Lock()  # OpenVINO InferRequest is not thread-safe; serialize execution.
-_ENGINE_STATE: dict | None = None  # {"engine", "device", "backend"} or {"engine": None, ...}
+# 엔진은 스레드별로 독립적으로 생성하여 병렬 추론을 지원 (Thread-local 캐시)
+_ENGINE_LOCK = threading.Lock()  # 엔진 로드 시점의 동시성 제어용
+_THREAD_LOCAL = threading.local()  # 스레드별 엔진 인스턴스 격리 저장소
+
+
+def _verify_openvino_gpu() -> tuple[list[str], bool]:
+    """Check available OpenVINO devices and verify if GPU is active."""
+    try:
+        from openvino.runtime import Core
+        core = Core()
+        devices = core.available_devices
+        has_gpu = any("GPU" in d.upper() for d in devices)
+        return devices, has_gpu
+    except Exception:
+        return [], False
 
 
 def _device_priority(config: dict) -> list[str]:
@@ -84,27 +96,26 @@ def _try_build_rapidocr(device_priority: list[str], lang: str):
 
 
 def _get_engine(config: dict):
-    """Return (engine, device, backend) or (None, '', 'unavailable'); built once."""
-    global _ENGINE_STATE
-    if _ENGINE_STATE is not None:
-        st = _ENGINE_STATE
-        return st["engine"], st["device"], st["backend"]
-    with _ENGINE_LOCK:
-        if _ENGINE_STATE is not None:
-            st = _ENGINE_STATE
-            return st["engine"], st["device"], st["backend"]
-        device_priority = _device_priority(config)
-        lang = str(config.get("lang", "korean"))
-        built = _try_build_rapidocr(device_priority, lang) or _try_build_rapidocr_openvino(device_priority)
-        if built is None:
-            print("[ocr_accelerated] RapidOCR/OpenVINO unavailable - falling back to Tesseract pipeline.")
-            _ENGINE_STATE = {"engine": None, "device": "", "backend": "unavailable"}
-        else:
-            engine, device, backend = built
-            print(f"[ocr_accelerated] engine ready backend={backend} device={device}")
-            _ENGINE_STATE = {"engine": engine, "device": device, "backend": backend}
-        st = _ENGINE_STATE
-        return st["engine"], st["device"], st["backend"]
+    """Return (engine, device, backend) for the current thread, cached via thread-local storage."""
+    if not hasattr(_THREAD_LOCAL, "engine_state"):
+        # 모델 로딩 시점에 여러 스레드가 동시에 생성하여 하드웨어 부하가 집중되는 것을 방지하기 위해 빌드만 락 보호
+        with _ENGINE_LOCK:
+            if not hasattr(_THREAD_LOCAL, "engine_state"):
+                device_priority = _device_priority(config)
+                lang = str(config.get("lang", "korean"))
+                built = _try_build_rapidocr(device_priority, lang) or _try_build_rapidocr_openvino(device_priority)
+                tid = threading.get_ident()
+                if built is None:
+                    print(f"[ocr_accelerated][Thread-{tid}] RapidOCR/OpenVINO unavailable - falling back to Tesseract pipeline.")
+                    _THREAD_LOCAL.engine_state = {"engine": None, "device": "", "backend": "unavailable"}
+                else:
+                    engine, device, backend = built
+                    devices, has_gpu = _verify_openvino_gpu()
+                    print(f"[ocr_accelerated][Thread-{tid}] Thread-local engine ready backend={backend} requested_device={device}")
+                    print(f"[ocr_accelerated][Thread-{tid}] OpenVINO devices: {devices} (Has GPU: {has_gpu})")
+                    _THREAD_LOCAL.engine_state = {"engine": engine, "device": device, "backend": backend}
+    st = _THREAD_LOCAL.engine_state
+    return st["engine"], st["device"], st["backend"]
 
 
 def is_available(config: dict) -> bool:
@@ -114,8 +125,8 @@ def is_available(config: dict) -> bool:
 
 def _run_engine_on_image(engine, image) -> tuple[str, float]:
     """Run RapidOCR on a BGR/RGB numpy image. Returns (text, mean_conf_0_100)."""
-    with _INFERENCE_LOCK:
-        output = engine(image)
+    # Removed global _INFERENCE_LOCK to allow concurrent inference on thread-local engines
+    output = engine(image)
     # rapidocr_openvino: returns (result, elapse); result = [[box, text, score], ...] or None
     # rapidocr 2.x: returns an object with .txts / .scores
     texts: list[str] = []
@@ -209,6 +220,12 @@ def run_accelerated_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_se
         txt_path = dirs["page_txt"] / f"page_{page_no:04d}.txt"
         txt_path.write_text(normalized, encoding="utf-8")
 
+        # Explicitly release per-page image objects to keep memory low
+        try:
+            del image, img
+        except Exception:
+            pass
+
         if normalized == "__NO_TEXT__" or text_len < min_len:
             status = "failed"
             failed_pages.append(page_no)
@@ -232,6 +249,16 @@ def run_accelerated_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_se
         final_status = "timeout_partial" if merged_text != "__NO_TEXT__" else "timeout_no_text"
     else:
         final_status = "success" if merged_text != "__NO_TEXT__" else "no_text"
+
+    # ── 임시 파일 정리 (rendered/processed/page_txt 삭제) ─────────────────────────
+    # cleanup_after_ocr=True(기본)이면 OCR 완료 후 대용량 임시 폴더 삭제
+    if bool(config.get("cleanup_after_ocr", True)):
+        for _subdir in ("rendered", "processed", "page_txt"):
+            try:
+                shutil.rmtree(dirs[_subdir], ignore_errors=True)
+            except Exception:
+                pass
+        print(f"[ocr_accelerated] 임시 이미지 정리 완료: {run_dir}")
 
     summary = {
         "pdf_path": str(pdf_path),

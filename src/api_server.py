@@ -4,6 +4,30 @@ import asyncio
 import json
 import os
 import sys
+
+# ── Global surrogate cleaning patch for JSON serialization ───────────────────
+def clean_surrogates(val):
+    if isinstance(val, str):
+        return "".join(c if not (0xD800 <= ord(c) <= 0xDFFF) else "\uFFFD" for c in val)
+    elif isinstance(val, dict):
+        return {clean_surrogates(k): clean_surrogates(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [clean_surrogates(x) for x in val]
+    elif isinstance(val, tuple):
+        return tuple(clean_surrogates(x) for x in val)
+    elif isinstance(val, set):
+        return {clean_surrogates(x) for x in val}
+    return val
+
+_original_dumps = json.dumps
+def _safe_dumps(obj, *args, **kwargs):
+    try:
+        cleaned = clean_surrogates(obj)
+    except Exception:
+        cleaned = obj
+    return _original_dumps(cleaned, *args, **kwargs)
+json.dumps = _safe_dumps
+# ─────────────────────────────────────────────────────────────────────────────
 import threading
 import time as _time
 
@@ -365,20 +389,28 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
         sp_sem  = BoundedSemaphore(max(1, perf["workers"])) if sp_client else None
         active_files: dict[int, str] = {}
 
+        # Use a sliding window to limit active Futures in the executor queue (Backpressure)
+        max_active = max(1, perf["workers"] * 2)
+        uncached_iter = iter(uncached)
+        futures = {}
+        pending = set()
+
         with ThreadPoolExecutor(max_workers=perf["workers"],
                                 thread_name_prefix="analysis") as executor:
-            futures = {
-                executor.submit(
+            # Initial fill
+            for rec, ck in uncached_iter:
+                f = executor.submit(
                     _analyze_single_record,
                     rec, runtime_cfg, temp_dir, llm,
                     bool(runtime_cfg["llm"].get("enabled", True)),
                     perf["llm_excerpt_chars"], perf["extract_max_chars"],
                     ck, ocr_sem, llm_sem, sp_client, sp_sem, active_files,
-                ): rec
-                for rec, ck in uncached
-            }
+                )
+                futures[f] = rec
+                pending.add(f)
+                if len(pending) >= max_active:
+                    break
 
-            pending = set(futures)
             while pending:
                 done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
                 with _session_lock:
@@ -393,9 +425,9 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
                         ar, ck, payload = future.result()
                         cache_entries[ck] = payload
                         all_records.append(ar)
-                        rec = _record_to_dict(ar)
+                        rec_dict = _record_to_dict(ar)
                         with _session_lock:
-                            _session.records.append(rec)
+                            _session.records.append(rec_dict)
                             _session.processed += 1
                             if ar.naming.needs_manual_review:
                                 _session.manual_review += 1
@@ -403,7 +435,7 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
                         with _session_lock:
                             _session.processed += 1
                             _session.errors += 1
-                        rec = {
+                        rec_dict = {
                             "seq": record.seq,
                             "original_file_name": record.original_file_name,
                             "original_full_path": record.original_full_path,
@@ -421,7 +453,10 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
                             "reason": f"분석 처리 오류: {exc}",
                         }
                         with _session_lock:
-                            _session.records.append(rec)
+                            _session.records.append(rec_dict)
+
+                    # Explicitly clean up completed future references
+                    del futures[future]
 
                     elapsed = _time.monotonic() - _session.start_time
                     _broadcast({
@@ -431,8 +466,27 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
                         "elapsed": round(elapsed, 1),
                         "cache_hit": False,
                         "active": list(active_files.values()),
-                        "record": rec,
+                        "record": rec_dict,
                     })
+
+                # Refill the window
+                with _session_lock:
+                    is_cancelled = _session.cancelled
+                if not is_cancelled:
+                    while len(pending) < max_active:
+                        try:
+                            rec, ck = next(uncached_iter)
+                        except StopIteration:
+                            break
+                        f = executor.submit(
+                            _analyze_single_record,
+                            rec, runtime_cfg, temp_dir, llm,
+                            bool(runtime_cfg["llm"].get("enabled", True)),
+                            perf["llm_excerpt_chars"], perf["extract_max_chars"],
+                            ck, ocr_sem, llm_sem, sp_client, sp_sem, active_files,
+                        )
+                        futures[f] = rec
+                        pending.add(f)
 
         # 취소된 경우 중간 결과만 저장하고 종료
         with _session_lock:
@@ -456,6 +510,10 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
         mark_conflicts(all_records)
 
         # Replace session records with conflict-resolved, seq-sorted list
+        # Release heavy extracted_text from memory as Excel report has been generated
+        for ar in all_records:
+            ar.extraction.extracted_text = ""  # Free heavy text data
+
         with _session_lock:
             _session.records = [_record_to_dict(ar) for ar in all_records]
             _session.all_analysis_records = list(all_records)
@@ -483,6 +541,35 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
             "elapsed": round(elapsed, 1),
             "review_path": _session.review_path,
         })
+
+        # ── 분석 완료 후 임시 파일 자동 정리 ──────────────────────────────────────
+        try:
+            import shutil as _shutil
+            import time as _wall_time
+            _temp_dir_path = resolve_project_path(PROJECT_ROOT, _config["temp"]["dir"])
+
+            # 1) SharePoint 다운로드 임시 폴더 정리
+            _sp_dl_dir = _temp_dir_path / "sp_downloads"
+            if _sp_dl_dir.exists():
+                _shutil.rmtree(_sp_dl_dir, ignore_errors=True)
+                print("[analyze] sp_downloads 임시 폴더 정리 완료")
+
+            # 2) 오래된 OCR 캐시 정리 (temp_cleanup_days일 이상 된 항목)
+            _cleanup_days = int(_config.get("performance", {}).get("temp_cleanup_days", 1))
+            if _cleanup_days > 0:
+                _ocr_runs_dir = _temp_dir_path / "ocr_runs"
+                if _ocr_runs_dir.exists():
+                    _cutoff_wall = _wall_time.time() - (_cleanup_days * 86400)
+                    for _run_d in _ocr_runs_dir.iterdir():
+                        if _run_d.is_dir():
+                            try:
+                                if _run_d.stat().st_mtime < _cutoff_wall:
+                                    _shutil.rmtree(_run_d, ignore_errors=True)
+                                    print(f"[analyze] 오래된 OCR 캐시 삭제: {_run_d.name}")
+                            except Exception:
+                                pass
+        except Exception as _cleanup_exc:
+            print(f"[analyze] 임시 파일 정리 중 오류 (무시): {_cleanup_exc}")
 
     except Exception as exc:
         with _session_lock:

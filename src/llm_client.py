@@ -20,10 +20,18 @@ class LLMClient:
         self.enabled = bool(config["llm"].get("enabled", True))
         self.temperature = float(config["llm"].get("temperature", 0.1))
         self.timeout_seconds = int(config["llm"].get("timeout_seconds", 120))
-        openai_cfg = config["llm"].get("openai", {})
-        self.model = str(openai_cfg.get("model", "gpt-4.1-mini"))
-        self.base_url = str(openai_cfg.get("base_url", "https://api.openai.com/v1")).rstrip("/")
-        self.api_key = str(openai_cfg.get("api_key", "") or os.getenv("OPENAI_API_KEY", ""))
+        # Gemini (Google Generative Language API) 설정
+        gemini_cfg = config["llm"].get("gemini", {})
+        self.model = str(gemini_cfg.get("model", "gemini-2.5-flash"))
+        self.base_url = str(
+            gemini_cfg.get("base_url", "https://generativelanguage.googleapis.com/v1beta")
+        ).rstrip("/")
+        # 키: config 우선, 없으면 .env의 GEMINI_API_KEY → GOOGLE_API_KEY 순
+        self.api_key = str(
+            gemini_cfg.get("api_key", "")
+            or os.getenv("GEMINI_API_KEY", "")
+            or os.getenv("GOOGLE_API_KEY", "")
+        )
         rules_path = project_root / "data" / "naming_rules.md"
         self.naming_rules = rules_path.read_text(encoding="utf-8") if rules_path.exists() else ""
 
@@ -33,7 +41,53 @@ class LLMClient:
         if not self.api_key:
             return None
         prompt = self._build_prompt(payload)
-        return self._call_openai(prompt)
+        return self._call_gemini(prompt)
+
+    def test_connection(self) -> dict:
+        """Gemini API 키/모델 연결을 가볍게 점검한다. UI·CLI에서 사용.
+
+        반환: {ok, model, base_url, status?, message?, error?}
+        """
+        result: dict = {"ok": False, "model": self.model, "base_url": self.base_url}
+        if not self.api_key:
+            result["error"] = ".env(또는 config.yaml)에 GEMINI_API_KEY가 설정되지 않았습니다."
+            return result
+        # 키 노출 방지를 위해 마스킹된 미리보기 제공
+        key = self.api_key
+        result["key_preview"] = (key[:6] + "…" + key[-4:]) if len(key) > 12 else "****"
+        try:
+            import requests
+            resp = requests.post(
+                f"{self.base_url}/models/{self.model}:generateContent",
+                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": "Reply with the single word OK."}]}],
+                    "generationConfig": {"temperature": 0, "maxOutputTokens": 5},
+                },
+                timeout=20,
+            )
+            result["status"] = resp.status_code
+            if resp.ok:
+                result["ok"] = True
+                result["message"] = f"연결 성공 (모델 응답: {self._extract_text_from_gemini(resp.json()) or 'OK'})"
+                return result
+            # 오류 메시지 추출
+            try:
+                err = resp.json().get("error", {}).get("message") or resp.text[:300]
+            except Exception:
+                err = resp.text[:300]
+            if resp.status_code in (400, 401, 403):
+                result["error"] = f"인증/권한 실패({resp.status_code}): API 키가 올바르지 않거나 권한이 없습니다. {err}"
+            elif resp.status_code == 404:
+                result["error"] = f"모델/엔드포인트를 찾을 수 없음(404): 모델명 '{self.model}' 또는 base_url을 확인하세요. {err}"
+            elif resp.status_code == 429:
+                result["error"] = f"요청 한도 초과(429): {err}"
+            else:
+                result["error"] = f"HTTP {resp.status_code}: {err}"
+            return result
+        except Exception as exc:
+            result["error"] = f"연결 오류: {type(exc).__name__}: {exc}"
+            return result
 
     def generate_short_title(self, summary: str) -> str:
         """summary에서 10자 이내 파일명 제목을 생성한다. 실패 시 빈 문자열 반환."""
@@ -51,58 +105,43 @@ class LLMClient:
         )
         try:
             import requests
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
             resp = requests.post(
-                f"{self.base_url}/chat/completions",
+                f"{self.base_url}/models/{self.model}:generateContent",
                 headers=headers,
-                json={"model": self.model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": 20},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.0, "maxOutputTokens": 30},
+                },
                 timeout=30,
             )
             if resp.ok:
-                return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                return self._extract_text_from_gemini(resp.json())
         except Exception:
             pass
         return ""
 
-    def _call_openai(self, prompt: str) -> dict | None:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+    def _call_gemini(self, prompt: str) -> dict | None:
+        headers = {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
         try:
             import requests
 
-            # Responses API 시도
             response = requests.post(
-                f"{self.base_url}/responses",
-                headers=headers,
-                json={"model": self.model, "input": prompt, "temperature": self.temperature},
-                timeout=self.timeout_seconds,
-            )
-            if response.ok:
-                raw = self._extract_text_from_responses(response.json())
-                return self._parse_json(raw or "")
-
-            # Chat Completions API 폴백
-            chat_response = requests.post(
-                f"{self.base_url}/chat/completions",
+                f"{self.base_url}/models/{self.model}:generateContent",
                 headers=headers,
                 json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": self.temperature,
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": self.temperature,
+                        # JSON 스키마 응답을 강제해 파싱 신뢰도를 높인다
+                        "responseMimeType": "application/json",
+                    },
                 },
                 timeout=self.timeout_seconds,
             )
-            chat_response.raise_for_status()
-            raw = (
-                chat_response.json()
-                .get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-            return self._parse_json(raw)
+            response.raise_for_status()
+            raw = self._extract_text_from_gemini(response.json())
+            return self._parse_json(raw or "")
         except Exception:
             return None
 
@@ -111,6 +150,7 @@ class LLMClient:
             "summary": "",
             "document_abstract": "",
             "document_title": "",
+            "original_title": "",
             "doc_type": "",
             "case_or_project_name": "",
             "institution_or_lawfirm": "",
@@ -178,21 +218,35 @@ class LLMClient:
             "  Write in flowing sentences, not bullet points or pipe-delimited format.\n"
             "  Example: '두바이 Sunrise 건설 프로젝트 관련 손해배상 청구 계약서로, 포스코인터내셔널(갑)과 Al Dhaheri Trading LLC(을) 간 체결되었다. 공사 완료 후 대금 USD 2,340,000 미지급을 원인으로 하며, 계약 체결일은 2014년 5월 19일이다. SIAC 중재 절차가 진행 중이며, 대리 법무법인은 Pillsbury Winthrop이다.'\n"
             "  If OCR quality is poor, write what can be inferred with a note: '(OCR 품질 낮아 일부 내용 불명확)'\n\n"
-            "doc_type rules (CRITICAL — pick exactly ONE from this list):\n"
-            "  소송진행보고  — 소송 현황·일정·심리기일 보고, 변호사 의견 보고\n"
-            "  심리결과보고  — 판결문, 결정문, 심리 결과 요약\n"
-            "  법원명령      — 법원 명령·결정·가처분·가압류 결정\n"
-            "  상대방서면    — 상대방이 제출한 소장·준비서면·답변서\n"
-            "  증거서류      — 계약서·영수증·인증서·등기 등 증거로 쓰이는 원본 문서\n"
-            "  법률의견      — 변호사 의견서, 내부 검토 의견, 법적 리스크 검토\n"
-            "  계약서        — 계약서·협약서·양해각서·합의서·위임장 원본\n"
-            "  통지서        — 법률통지·내용증명·청구서·이행촉구서·품의서\n"
-            "  기타          — 위 8가지에 해당하지 않을 때만 사용\n\n"
+            "CONTEXT — these are NON-CORE '기타문서' (miscellaneous documents), NOT core pleadings.\n"
+            "  Apply legal classification LOOSELY. Do NOT force a document into a legal category.\n"
+            "  Only assign a category label when the document CLEARLY matches it; otherwise default to '기타'\n"
+            "  and name the document by its own concrete subject.\n\n"
+            "doc_type rules (a WEAK hint, not mandatory — choose ONE or '기타'):\n"
+            "  Reference taxonomy (use ONLY on clear keyword/structure match):\n"
+            "    소장      — complaint, petition, summons, writ of summons, notice of appeal (강한 단서)\n"
+            "    답변서    — answer, defence/defense, jawapan, response/reply to a claim\n"
+            "    준비서면  — motion(강한 단서), opposition, memorandum, brief, submission, affidavit, application\n"
+            "    판결      — judgment, decision, order, decree, sentença/sentencia, ordonnance, signed/court order\n"
+            "    검토의견서 — opinion, legal opinion, counsel memo, advisory, analysis, advice\n"
+            "    내부보고서 — 내부 보고·현황·요약 report (internal)\n"
+            "    합의서    — agreement, settlement, release, rule 11 agreement, MOU\n"
+            "    진술서    — witness statement, affidavit/declaration of a person\n"
+            "    기타      — DEFAULT. subpoena, exhibit, transcript, certificate, invoice, notice, deed,\n"
+            "                form, notification, and anything not clearly above. Most 기타문서 fall here.\n\n"
             "document_title rules:\n"
-            "  - Max 10 chars. Derived from doc_type + core legal issue of this specific document.\n"
-            "  - Use Korean. Use English ONLY for: proper nouns, original document title, legally critical original-language terms.\n"
-            "  - DO NOT use generic words alone: '문서', 'document', 'submission', 'hearing', 'delay' as standalone title.\n"
-            "  - Good examples: '관세소송보고', '가압류결정', '위임장', '세관심리결과', 'Settlement Agreement', 'Power of Attorney'\n\n"
+            "  - Korean, concise (≈ up to 12 chars / 30 if it is the document's own proper name).\n"
+            "  - For a clearly-classified doc: use the category + specific issue (예: '가압류결정', '검토의견서').\n"
+            "  - For '기타' (default): use the document's OWN specific subject/name faithfully\n"
+            "    (예: '세관통관확인서', '대금영수증', '여권사본', '공증인증서').\n"
+            "  - Use English ONLY for proper nouns or untranslatable terms (예: 'Power of Attorney').\n"
+            "  - STRICTLY FORBIDDEN: vague/umbrella words such as '관련문서', '관련 문서', '문서', '자료',\n"
+            "    'document', 'related', 'submission' used alone. Be specific.\n\n"
+            "original_title rules (해외건 only):\n"
+            "  - If this is an overseas document with an English/original-language title visible in the body\n"
+            "    (e.g. a header like 'POWER OF ATTORNEY', 'CERTIFICATE OF INCORPORATION'), return it concisely.\n"
+            "  - Domestic Korean documents OR no clear original title → return empty string \"\".\n"
+            "  - Do NOT duplicate document_title; do NOT invent a title.\n\n"
             "document_date rules (CRITICAL — follow this order strictly):\n"
             "  1. The filename often contains the most reliable date (e.g. _200303, _20200312). Treat it as a strong prior.\n"
             "  2. Override with a body date ONLY if it clearly shows issue/signing date near the top AND within 5 years of filename date.\n"
@@ -258,14 +312,16 @@ class LLMClient:
         )
 
     @staticmethod
-    def _extract_text_from_responses(data: dict) -> str:
-        if isinstance(data.get("output_text"), str) and data["output_text"].strip():
-            return data["output_text"].strip()
-        output = data.get("output", [])
+    def _extract_text_from_gemini(data: dict) -> str:
+        """Gemini generateContent 응답에서 텍스트를 추출한다.
+
+        구조: candidates[].content.parts[].text
+        """
         texts: list[str] = []
-        for item in output:
-            for content in item.get("content", []):
-                text = content.get("text")
+        for candidate in data.get("candidates", []) or []:
+            content = candidate.get("content", {}) or {}
+            for part in content.get("parts", []) or []:
+                text = part.get("text")
                 if isinstance(text, str) and text.strip():
                     texts.append(text.strip())
         return "\n".join(texts).strip()
@@ -286,3 +342,32 @@ class LLMClient:
 
 # 하위 호환성을 위한 별칭
 OllamaClient = LLMClient
+
+
+def _cli_test_key() -> int:
+    """CLI: Gemini API 키 연결 테스트.
+
+    사용법:  python src/llm_client.py   (config.yaml + .env 사용)
+    """
+    from config_loader import load_config
+
+    project_root = Path(__file__).resolve().parent.parent
+    config = load_config(str(project_root / "config.yaml"))
+    client = LLMClient(config, project_root)
+    print("[llm-test] Gemini API 키 연결을 확인합니다...")
+    print(f"  base_url = {client.base_url}")
+    print(f"  model    = {client.model}")
+    res = client.test_connection()
+    if res.get("key_preview"):
+        print(f"  api_key  = {res['key_preview']}")
+    if res.get("ok"):
+        print(f"\n✅ {res.get('message', '연결 성공')}")
+        return 0
+    print(f"\n❌ 실패: {res.get('error', '알 수 없는 오류')}")
+    print("  • .env의 GEMINI_API_KEY 값을 확인하세요.")
+    print("  • config.yaml의 llm.gemini.model / base_url 을 확인하세요.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_test_key())

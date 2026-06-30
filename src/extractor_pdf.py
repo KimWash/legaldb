@@ -10,6 +10,7 @@ import warnings
 
 from models import ExtractionResult
 from ocr_advanced import run_advanced_ocr
+from ocr_accelerated import run_accelerated_ocr
 from ocr_runner import run_ocrmypdf
 
 
@@ -66,6 +67,32 @@ def _extract_with_advanced_ocr(path: Path, config: dict, temp_dir: Path, max_cha
     )
 
 
+def _extract_with_accelerated_ocr(path: Path, config: dict, temp_dir: Path, max_chars: int) -> ExtractionResult:
+    """OpenVINO/RapidOCR (Intel Arc GPU/NPU) backend. status='advanced_ocr:unavailable' 시 폴백 신호."""
+    accel_cfg = dict(config.get("ocr", {}).get("accelerated", {}))
+    timeout_secs = int(accel_cfg.get("timeout_seconds", config.get("ocr", {}).get("advanced", {}).get("timeout_seconds", 0)))
+    result = run_accelerated_ocr(path, temp_dir=temp_dir, config=accel_cfg, timeout_seconds=timeout_secs)
+    norm = re.sub(r"\s+", "", result.text or "")
+    threshold = int(config["ocr"].get("force_ocr_threshold_chars", 80))
+    is_success = result.status in ("success", "timeout_partial") and bool(result.text)
+    return ExtractionResult(
+        file_type="pdf-image",
+        extraction_status="success" if is_success else f"accelerated_ocr:{result.status}",
+        extracted_text=result.text,
+        text_excerpt=(result.text or "")[:max_chars],
+        page_count=result.total_pages,
+        ocr_used=True,
+        ocr_quality_low=(len(norm) < threshold) or bool(result.failed_pages),
+        ocr_mean_confidence=float(result.mean_confidence or 0.0),
+        notes=[
+            f"Accelerated OCR (OpenVINO/RapidOCR) used (status={result.status}).",
+            f"Accelerated OCR run dir: {result.run_dir}",
+            f"Accelerated OCR mean confidence: {result.mean_confidence}",
+            f"Accelerated OCR failed pages: {result.failed_pages}",
+        ],
+    )
+
+
 def _extract_with_ocrmypdf(path: Path, config: dict, temp_dir: Path, max_chars: int, page_count_hint: int) -> ExtractionResult:
     with NamedTemporaryFile(dir=temp_dir, suffix=".pdf", delete=False) as handle:
         ocr_output = Path(handle.name)
@@ -109,6 +136,7 @@ def _extract_with_ocrmypdf(path: Path, config: dict, temp_dir: Path, max_chars: 
 def extract_pdf(path: Path, config: dict, temp_dir: Path, max_chars: int = 8000) -> ExtractionResult:
     threshold = int(config["ocr"].get("force_ocr_threshold_chars", 80))
     ocr_enabled = bool(config["ocr"].get("enabled", True))
+    engine = str(config.get("ocr", {}).get("engine", "tesseract")).lower()
     advanced_enabled = bool(config.get("ocr", {}).get("advanced", {}).get("enabled", True))
     fallback_to_ocrmypdf = bool(config.get("ocr", {}).get("advanced", {}).get("fallback_to_ocrmypdf", True))
 
@@ -135,8 +163,17 @@ def extract_pdf(path: Path, config: dict, temp_dir: Path, max_chars: int = 8000)
                 notes=["OCR disabled and PDF text was insufficient."],
             )
 
+        # 1순위: Intel 가속(OpenVINO/RapidOCR). 미가용/실패 시 Tesseract(advanced)→ocrmypdf 폴백.
+        if engine == "accelerated":
+            accel_result = _extract_with_accelerated_ocr(path, config=config, temp_dir=temp_dir, max_chars=max_chars)
+            if accel_result.extraction_status == "success":
+                return accel_result
+            accel_status = accel_result.extraction_status
+
         if advanced_enabled:
             advanced_result = _extract_with_advanced_ocr(path, config=config, temp_dir=temp_dir, max_chars=max_chars)
+            if engine == "accelerated":
+                advanced_result.notes.append(f"Accelerated OCR fell back: {accel_status}")
             if advanced_result.extraction_status == "success":
                 return advanced_result
             if fallback_to_ocrmypdf:

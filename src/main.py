@@ -28,7 +28,7 @@ from extractor_pptx import extract_pptx
 from extractor_xlsx import extract_xlsx
 from llm_client import OllamaClient
 from models import AnalysisRecord, ExtractionResult, NamingResult
-from naming_engine import infer_case_name, infer_doc_type, infer_institution, mark_conflicts, normalize_date, propose_name
+from naming_engine import infer_case_name, infer_doc_type, infer_institution, is_rename_scope, mark_conflicts, normalize_date, propose_name
 from rename_executor import execute_rename
 from rollback_executor import execute_rollback
 from scanner import scan_files, scan_sharepoint_files
@@ -39,7 +39,7 @@ SUMMARY_SIGNAL_PATTERN = re.compile(
     r"계약|합의|소송|중재|의견|보고|통지|결의|증명|등기|양해각서|수정계약서)",
     re.IGNORECASE,
 )
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 7
 
 _LEGAL_META_KEYS = [
     "case_name_normalized", "case_alias", "case_type", "dispute_type",
@@ -184,8 +184,8 @@ def _build_cache_key(record, config: dict, perf: dict) -> str:
         "path": record.original_full_path,
         "size": record.file_size,
         "mtime": record.last_modified_time,
-        "llm_provider": config.get("llm", {}).get("provider", "ollama"),
-        "llm_model": config.get("llm", {}).get("openai", {}).get("model", ""),
+        "llm_provider": config.get("llm", {}).get("provider", "gemini"),
+        "llm_model": config.get("llm", {}).get("gemini", {}).get("model", ""),
         "llm_primary_model": config.get("llm", {}).get("primary_model", ""),
         "excerpt_chars": perf.get("llm_excerpt_chars", 0),
         "extract_max_chars": perf.get("extract_max_chars", 0),
@@ -208,6 +208,18 @@ def _should_call_llm(record, extraction: ExtractionResult, use_llm: bool) -> boo
 
 
 def _build_analysis_result(record, extraction: ExtractionResult, llm_result: dict | None, config: dict, llm_client=None) -> AnalysisRecord:
+    # 범위 밖('4. 기타문서' 아님) 파일은 (지원 여부와 무관하게) 원본명 유지 — 캐시 적중/신규 경로 동일 처리
+    if not is_rename_scope(record):
+        naming = NamingResult(
+            suggested_file_name=record.original_file_name,
+            suggested_full_path=record.original_full_path,
+            reason="개명 대상 폴더('4. 기타문서')가 아니어서 원본 파일명을 유지합니다.",
+            confidence=0.0,
+            needs_manual_review=False,
+            rename_status="out_of_scope",
+            rollback_name=record.original_file_name,
+        )
+        return AnalysisRecord(record, extraction, naming, {})
     naming = propose_name(record, extraction, llm_result, config, llm_client=llm_client)
     if extraction.extraction_status == "manual_review_required":
         naming.reason = "구 버전 문서 형식(.doc/.ppt)으로 수동 검토 또는 변환이 필요합니다."
@@ -303,14 +315,25 @@ def _analyze_single_record_inner(
     sp_client: SharePointClient | None = None,
     sp_semaphore: BoundedSemaphore | None = None,
 ) -> tuple[AnalysisRecord, str, dict]:
+    # 개명 대상은 경로에 '4. 기타문서'가 있는 파일뿐. 범위 밖이면 (지원 여부 무관) OCR/LLM 생략·원본명 유지.
+    if not is_rename_scope(record):
+        extraction = ExtractionResult(
+            file_type=record.file_extension.lstrip(".") or "file",
+            extraction_status="skipped_out_of_scope",
+            notes=["'4. 기타문서' 경로가 아니어서 개명 대상에서 제외 (OCR/LLM 생략)."],
+        )
+        analysis = _build_analysis_result(record, extraction, None, config)
+        cache_payload = {"extraction": asdict(extraction), "llm_result": None}
+        return analysis, cache_key, cache_payload
+
+    # 범위 안이지만 지원하지 않는 형식 → 내용을 못 읽으므로 파일명+폴더명 추론으로 제안.
     if not record.supported:
         extraction = ExtractionResult(
             file_type="unsupported",
-            extraction_status="skipped",
-            notes=["Unsupported extension or temporary Office file."],
+            extraction_status="unsupported_inference",
+            notes=["지원하지 않는 형식 — 파일명/폴더명 기반 추론으로 파일명 제안."],
         )
-        naming = NamingResult(reason="지원하지 않는 파일 형식으로 분석 대상에서 제외됩니다.", confidence=0.0, needs_manual_review=True, rename_status="unsupported", rollback_name=record.original_file_name)
-        analysis = AnalysisRecord(record, extraction, naming)
+        analysis = _build_analysis_result(record, extraction, None, config)
         cache_payload = {"extraction": asdict(extraction), "llm_result": None}
         return analysis, cache_key, cache_payload
 

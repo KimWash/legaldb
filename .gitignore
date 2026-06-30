@@ -14,8 +14,10 @@ venv/
 output/
 temp/
 
-# Claude Code session files (random-named)
+# Claude Code session files (random-named 8-char dirs)
 [0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-][0-9a-z_-]
+# 위 패턴이 8글자 실디렉터리(frontend)를 잡지 않도록 명시적으로 추적
+!frontend/
 
 # Memory
 memory/

@@ -17,21 +17,32 @@ exclude_extensions:
   - ".png"
   - ".html"
 llm:
-  provider: "openai"
+  provider: "gemini"
   enabled: true
   temperature: 0.1
   timeout_seconds: 90
-  openai:
-    model: "gpt-4.1-mini"
-    base_url: "https://api.openai.com/v1"
-    api_key: ""
+  gemini:
+    model: "gemini-2.5-flash"
+    base_url: "https://generativelanguage.googleapis.com/v1beta"
+    api_key: ""   # 비우면 .env의 GEMINI_API_KEY (또는 GOOGLE_API_KEY) 사용
 ocr:
   enabled: true
+  # OCR 엔진 선택: "accelerated" = Intel OpenVINO/RapidOCR(Arc GPU/NPU) 우선 → 실패 시 Tesseract 폴백
+  #               "tesseract"   = 기존 Tesseract 파이프라인만 사용
+  engine: "accelerated"
   language: "kor+eng"
   skip_text: true
   force_ocr_threshold_chars: 80
   keyword_confidence_threshold: 75.0
   timeout_seconds: 180
+  # Intel Ultra 7 155H 가속 백엔드 설정
+  accelerated:
+    device_priority: ["GPU", "NPU", "CPU"]   # Arc GPU 우선 → NPU → CPU, 실패 시 다음으로 폴백
+    lang: "korean"        # RapidOCR 인식 언어(한국어+영문)
+    dpi: 300
+    min_len: 40
+    preprocess: false     # RapidOCR는 자체 전처리 포함 (true면 ocr_advanced 전처리 적용)
+    timeout_seconds: 60
   advanced:
     enabled: true
     dpi: 300

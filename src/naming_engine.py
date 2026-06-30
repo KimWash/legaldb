@@ -8,26 +8,30 @@ import re
 from models import AnalysisRecord, ExtractionResult, FileRecord, NamingResult, build_suggested_path
 
 
+# 주의: 정규식 교대(alternation)는 순서대로 첫 일치를 채택하므로 두 자리(10~12월, 13~31일)를
+# 먼저 시도해야 한다. 예) 일(day) 그룹을 (0?[1-9]|[12]\d|...)로 쓰면 "19"가 "1"로 잘려 day=01이 됨.
+_MM = r"(1[0-2]|0?[1-9])"          # 월: 10~12 우선
+_DD = r"(3[01]|[12]\d|0?[1-9])"    # 일: 30/31, 19 등 두 자리 우선
 DATE_PATTERNS_WITH_DAY = [
     # YYYY.MM.DD / YYYY-MM-DD / YYYY년 M월 D일
-    re.compile(r"(20\d{2}|19\d{2})[.\-/년\s]+(0?[1-9]|1[0-2])[.\-/월\s]+(0?[1-9]|[12]\d|3[01])"),
+    re.compile(r"(20\d{2}|19\d{2})[.\-/년\s]+" + _MM + r"[.\-/월\s]+" + _DD),
     # YYYYMMDD (8자리)
     re.compile(r"(20\d{2}|19\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"),
     # YY.MM.DD / YY-MM-DD / YY/MM/DD (구분자 있음)
-    re.compile(r"\b(\d{2})[.\-/\s]+(0?[1-9]|1[0-2])[.\-/\s]+(0?[1-9]|[12]\d|3[01])\b"),
+    re.compile(r"\b(\d{2})[.\-/\s]+" + _MM + r"[.\-/\s]+" + _DD + r"\b"),
     # DD.MM.YYYY / DD-MM-YYYY (day-first)
-    re.compile(r"\b(0?[1-9]|[12]\d|3[01])[.\-/\s]+(0?[1-9]|1[0-2])[.\-/\s]+(20\d{2}|19\d{2})\b"),
+    re.compile(r"\b" + _DD + r"[.\-/\s]+" + _MM + r"[.\-/\s]+(20\d{2}|19\d{2})\b"),
     # YYMMDD (6자리, 구분자 없음) — 반드시 YYYYMM 패턴보다 먼저 시도해야
     # 200303 → yy=20(2020), mm=03, dd=03.  YYYYMMDD(8자리)와 구분: (?!\d)로 뒤 자리 없음 보장
     re.compile(r"(?<!\d)(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"),
 ]
 DATE_PATTERNS_YEAR_MONTH = [
     # Examples: 1993.4월 / 1993-04 / 1993년 4월
-    re.compile(r"(20\d{2}|19\d{2})[.\-/년\s]+(0?[1-9]|1[0-2])(?:[.\-/월\s]|$)"),
+    re.compile(r"(20\d{2}|19\d{2})[.\-/년\s]+" + _MM + r"(?:[.\-/월\s]|$)"),
     # Example: 199304 (YYYYMM)
     re.compile(r"(20\d{2}|19\d{2})(0[1-9]|1[0-2])(?!\d)"),
     # Example: 93.04 / 93-04 (YYMM with separator)
-    re.compile(r"\b(\d{2})[.\-/\s]+(0?[1-9]|1[0-2])\b"),
+    re.compile(r"\b(\d{2})[.\-/\s]+" + _MM + r"\b"),
 ]
 DOC_TYPE_KEYWORDS = [
     # 새 8분류 (LLM이 반환하는 값과 일치)
@@ -92,7 +96,16 @@ KEYWORD_POSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOC_TYPE_TITLE_MAP = {
-    # 새 8분류 — LLM이 반환하는 값 그대로 문서명으로 사용
+    # CSV(그룹,키워드 조합) 분류 — 명확히 일치할 때만 사용 (기타문서 대상이라 느슨 적용)
+    "소장": "소장",
+    "답변서": "답변서",
+    "준비서면": "준비서면",
+    "판결": "판결",
+    "검토의견서": "검토의견서",
+    "내부보고서": "내부보고",
+    "합의서": "합의서",
+    "진술서": "진술서",
+    # 구 8분류 (하위 호환 — LLM이 옛 값을 반환할 때 대비)
     "소송진행보고": "소송진행보고",
     "심리결과보고": "심리결과보고",
     "법원명령": "법원명령",
@@ -134,6 +147,98 @@ def sanitize_filename_component(value: str) -> str:
 def strip_folder_status_tag(name: str) -> str:
     """폴더명 앞의 [검토수행], [검토종결] 등 괄호 태그를 제거한다."""
     return re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", name or "").strip()
+
+
+# 개명 대상 폴더: 경로에 '4. 기타문서'(번호/공백 변형 허용)가 있을 때만
+RENAME_SCOPE_FOLDER_PATTERN = re.compile(r"^\s*4\s*[.\-]?\s*기타\s*문서")
+# 원본 파일명에서 추출하는 rev/버전/특이사항 표지
+REVISION_PATTERNS = [
+    re.compile(r"(rev(?:ision)?\.?\s*\d+)", re.IGNORECASE),
+    re.compile(r"(ver(?:sion)?\.?\s*\d+|v\.?\s*\d+)", re.IGNORECASE),
+    re.compile(r"(최종본|최종)"),
+    re.compile(r"(수정본\d*|수정\d*)"),
+    # 언더스코어/숫자 경계에서도 잡히도록 \b 대신 비문자 lookaround 사용
+    re.compile(r"(?<![A-Za-z])(final|draft|rev(?:ision)?)(?![A-Za-z])", re.IGNORECASE),
+]
+# document_title로 허용하지 않는 모호·포괄 표현
+VAGUE_TITLE_TOKENS = {"관련문서", "관련자료", "문서", "자료", "파일", "document", "related", "기타"}
+
+
+def is_rename_scope(file_record: FileRecord) -> bool:
+    """경로 폴더 중 '4. 기타문서'가 있는 파일만 개명 대상."""
+    for part in Path(file_record.relative_path_from_root).parts[:-1]:
+        if RENAME_SCOPE_FOLDER_PATTERN.match(strip_folder_status_tag(part)):
+            return True
+    return False
+
+
+def parse_revision_note(file_name: str) -> str:
+    """원본 파일명에서 rev/버전/최종/수정 등 특이사항 표지를 추출한다. 없으면 빈 문자열."""
+    stem = Path(file_name or "").stem
+    for pattern in REVISION_PATTERNS:
+        match = pattern.search(stem)
+        if match:
+            token = re.sub(r"\s+", "", match.group(1))
+            return sanitize_filename_component(token)
+    return ""
+
+
+def split_existing_prefix(file_name: str, org_name: str, project_name: str) -> tuple[str, str]:
+    """이미 전처리로 붙은 '조직_프로젝트명' 접두를 보존한다.
+
+    Returns (prefix, tail):
+      - 파일명이 org_name_ 으로 시작하면 'org_project' 토큰을 verbatim 보존하고 나머지를 tail로.
+      - 아니면 config org_name + 폴더 프로젝트명으로 접두를 합성하고 stem 전체를 tail로.
+    """
+    stem = Path(file_name or "").stem
+    org = sanitize_filename_component(org_name)
+    parts = stem.split("_")
+    if org and len(parts) >= 2 and sanitize_filename_component(parts[0]) == org:
+        prefix = sanitize_filename_component(f"{parts[0]}_{parts[1]}")
+        tail = "_".join(parts[2:]).strip()
+        return prefix, tail
+    proj = sanitize_filename_component(project_name)
+    prefix = "_".join([p for p in [org, proj] if p])
+    return prefix, stem
+
+
+def _is_vague_title(title: str) -> bool:
+    compact = re.sub(r"\s+", "", title or "")
+    if not compact:
+        return True
+    return compact in VAGUE_TITLE_TOKENS
+
+
+def _folder_title_hint(file_record: FileRecord) -> str:
+    """내용을 못 읽을 때 쓰는 폴더 기반 문서명 힌트.
+
+    대분류(0)·사건명(1)·번호형 카테고리 폴더('4. 기타문서','1. 사건기록')는 제외하고,
+    그 아래에 의미있는 하위 폴더명이 있으면 문서명 후보로 사용한다.
+    """
+    parts = [strip_folder_status_tag(p) for p in Path(file_record.relative_path_from_root).parts[:-1]]
+    for p in reversed(parts[2:]):
+        if re.match(r"^\s*\d+\s*[.\-]", p):  # 번호형 카테고리 폴더 제외
+            continue
+        h = sanitize_filename_component(p)
+        if len(re.findall(r"[A-Za-z가-힣]", h)) >= 2:
+            return h[:20]
+    return ""
+
+
+def _clean_title_tail(tail: str) -> str:
+    """원본 파일명 tail(접두 제거 후)을 문서 고유명 제목으로 정제한다.
+
+    언더스코어를 공백으로 풀고, scan/copy/img/rev 등 무의미 토큰과 날짜·일련번호를 제거.
+    의미있는 글자(영문/한글)가 2자 미만이면 빈 문자열을 반환한다.
+    """
+    t = sanitize_filename_component((tail or "").replace("_", " "))
+    # 숫자가 붙은 generic 토큰(scan001, img20140519 등)도 제거 — 좌우 비문자 경계 사용
+    t = re.sub(r"(?i)(?<![A-Za-z])(scan|copy|img|image|file|doc|page|final|draft|rev(?:ision)?|ver(?:sion)?|v)\d*(?![A-Za-z])", " ", t)
+    t = re.sub(r"\b\d{2,8}\b", " ", t)  # 날짜/일련번호 제거
+    t = re.sub(r"\s+", " ", t).strip(" -_")
+    if len(re.findall(r"[A-Za-z가-힣]", t)) < 2:
+        return ""
+    return t[:30]
 
 
 def _is_boilerplate_sentence(sentence: str) -> bool:
@@ -663,16 +768,21 @@ def _keyword_supported_by_text(keyword: str, text: str) -> bool:
     return hits >= max(1, len(parts) // 2)
 
 
-def build_filename(org_name: str, document_title: str, case_name: str, institution: str, document_date: str, english_keyword: str, extension: str) -> str:
-    # 패턴: 법무실_사건명_문서명_[키워드_]날짜
-    # 사건명(case_name)은 항상 2번째 자리 고정 (institution으로 대체하지 않음)
-    parts = [org_name]
-    if case_name and case_name != org_name:
-        parts.append(case_name)
-    parts.append(document_title or "문서")
-    if english_keyword:
-        parts.append(english_keyword)
-    parts.append(document_date or "date_unknown")
+def build_filename(prefix: str, document_title: str, original_title: str, document_date: str, revision_note: str, extension: str) -> str:
+    """패턴: {조직_프로젝트명(접두 보존)}_{문서제목}[_원문제목][_날짜][_특이사항].ext
+
+    prefix 는 split_existing_prefix 로 보존한 '조직_프로젝트명' 접두이다.
+    날짜를 모르면 'date_unknown'을 붙이지 않고 슬롯 자체를 생략한다.
+    institution·keyword·summary 는 파일명에 포함하지 않는다.
+    """
+    parts = [prefix, document_title or "문서"]
+    if original_title:
+        parts.append(original_title)
+    # 날짜는 있을 때만 추가 (없으면 date_unknown 대신 생략)
+    if document_date and document_date != "date_unknown":
+        parts.append(document_date)
+    if revision_note:
+        parts.append(revision_note)
     cleaned = [sanitize_filename_component(part) for part in parts if sanitize_filename_component(part)]
     return "_".join(cleaned) + extension
 
@@ -686,6 +796,8 @@ def _extraction_status_label(status: str) -> str:
         return "텍스트 부족 (OCR 미실행)"
     if status == "manual_review_required":
         return "수동 검토 필요 형식"
+    if status == "unsupported_inference":
+        return "지원하지 않는 형식 (파일명/폴더명 추론)"
     if status.startswith(("error:", "worker_error:")):
         return "추출 오류"
     if status.startswith("advanced_ocr:"):
@@ -715,7 +827,10 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
     threshold = float(config["naming"].get("confidence_threshold", 0.85))
     max_filename_length = int(config["naming"].get("max_filename_length", 180))
 
-    doc_type = sanitize_filename_component(str((llm_result or {}).get("doc_type") or infer_doc_type(extraction.text_excerpt, file_record.original_file_name)))
+    # 내용을 못 읽을 때(추출 실패/미지원)는 파일명 + 폴더명 힌트로 추론한다.
+    folder_hint = _folder_title_hint(file_record)
+    doctype_fallback_source = f"{file_record.original_file_name} {folder_hint}".strip()
+    doc_type = sanitize_filename_component(str((llm_result or {}).get("doc_type") or infer_doc_type(extraction.text_excerpt, doctype_fallback_source)))
     # 사건명은 항상 폴더 구조에서 가져온다 (LLM 결과 무시)
     case_name = infer_case_name(file_record)
     institution = sanitize_filename_component(str((llm_result or {}).get("institution_or_lawfirm") or infer_institution(extraction.text_excerpt, file_record.original_file_name)))
@@ -793,27 +908,41 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
         if not _summary_is_acceptable(summary, prefer_korean=prefer_korean_summary):
             summary = _build_structured_summary(doc_type, case_name, institution, keyword, max_len=80)
 
+    org_name = config["naming"].get("org_name", "법무실")
+    # 이미 전처리로 붙은 '조직_프로젝트명' 접두를 보존하고, 나머지(tail)는 fallback 제목 후보로 사용
+    prefix, original_tail = split_existing_prefix(file_record.original_file_name, org_name, case_name)
+
     llm_title = sanitize_filename_component(str((llm_result or {}).get("document_title") or ""))
     mapped_title = _mapped_doc_title(doc_type)
-    # document_title 우선 — doc_type 대분류보다 이 문서의 구체적 특성을 반영
-    if llm_title and re.match(r"^[A-Za-z가-힣0-9\s\-]{2,20}$", llm_title):
-        document_title = _normalize_document_title(llm_title, max_chars=10)
+    # 기타문서 대상 — LLM의 구체적 문서명을 최대한 보존 (모호·포괄 표현만 배제, 느슨 적용)
+    if llm_title and not _is_vague_title(llm_title):
+        document_title = llm_title[:30]
     elif mapped_title:
         document_title = mapped_title
     else:
-        # ③ 최후 수단: LLM이 있으면 summary에서 제목 재생성 요청, 없으면 프로그래매틱 추출
+        # LLM 제목이 없을 때(또는 LLM 호출 실패): 기타문서이므로 '문서 고유명' = 원본 파일명 tail을 우선 사용.
+        document_title = ""
         if llm_client is not None and summary:
             generated = llm_client.generate_short_title(summary)
-            if generated:
-                document_title = _normalize_document_title(generated, max_chars=10)
+            if generated and not _is_vague_title(generated):
+                document_title = _normalize_document_title(generated, max_chars=12)
+        if not document_title:
+            tail_title = _clean_title_tail(original_tail)
+            if tail_title:
+                document_title = tail_title
+            elif folder_hint:
+                # 파일명 tail이 비면 위치한 폴더명을 문서명 힌트로 사용
+                document_title = folder_hint
             else:
-                document_title = _document_title_from_summary(summary, doc_type)
-        else:
-            document_title = _document_title_from_summary(summary, doc_type)
-    if document_title == "문서" and doc_type:
-        document_title = _document_title_from_summary("", doc_type)
-    if not doc_type and not mapped_title and not llm_title:
-        document_title = "관련문서"
+                fallback = _document_title_from_summary(summary, doc_type)
+                document_title = "문서" if _is_vague_title(fallback) else fallback
+
+    # 원문제목(해외건, 존재 시) — LLM이 본문에서 추출한 영문 원문 제목
+    original_title = sanitize_filename_component(str((llm_result or {}).get("original_title") or ""))[:40]
+    if original_title and original_title.lower() == document_title.lower():
+        original_title = ""
+    # 추가특이사항 — 원본 파일명에서 rev/버전/최종/수정 파싱
+    revision_note = parse_revision_note(file_record.original_file_name)
 
     raw_abstract = str((llm_result or {}).get("document_abstract") or "").strip()
 
@@ -821,23 +950,24 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
         extracted_summary=summary,
         document_abstract=raw_abstract,
         extracted_document_title=document_title,
+        extracted_original_title=original_title,
         extracted_doc_type=doc_type,
         extracted_case_name=case_name,
         extracted_institution=institution,
         extracted_date=extracted_date,
         extracted_keyword=keyword,
+        revision_note=revision_note,
         reason=sanitize_filename_component(str((llm_result or {}).get("reason") or "")),
         confidence=float((llm_result or {}).get("confidence") or 0.72),
     )
     if source_quality < 0.55:
         result.confidence = min(result.confidence, 0.82)
     result.suggested_file_name = build_filename(
-        org_name=config["naming"].get("org_name", "법무실"),
+        prefix=prefix,
         document_title=result.extracted_document_title,
-        case_name=result.extracted_case_name,
-        institution=result.extracted_institution,
-        document_date=result.extracted_date or "date_unknown",
-        english_keyword=result.extracted_keyword,
+        original_title=result.extracted_original_title,
+        document_date=result.extracted_date,
+        revision_note=result.revision_note,
         extension=file_record.file_extension,
     )
     if len(result.suggested_file_name) > max_filename_length:
@@ -849,8 +979,8 @@ def propose_name(file_record: FileRecord, extraction: ExtractionResult, llm_resu
     needs_review, review_reason = evaluate_manual_review(extraction, result, threshold)
     result.needs_manual_review = needs_review
     if needs_review and review_reason:
-        prefix = result.reason.strip()
-        result.reason = f"{prefix} [{review_reason}]".strip() if prefix else f"[{review_reason}]"
+        reason_prefix = result.reason.strip()
+        result.reason = f"{reason_prefix} [{review_reason}]".strip() if reason_prefix else f"[{review_reason}]"
     result.rollback_name = file_record.original_file_name
     return result
 

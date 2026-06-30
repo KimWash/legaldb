@@ -21,8 +21,9 @@ SUPPORTED_EXTS = frozenset({
     ".xlsx", ".xls", ".eml",
 })
 
-# GPT-4.1-mini: ~3800 input tokens + ~700 output tokens per file (legal metadata) ≈ $0.0028
-LLM_COST_PER_FILE_USD = 0.0028
+# Gemini 2.5 Flash: ~3800 input + ~700 output tokens per file (legal metadata) ≈ $0.0029
+# (input ~$0.30/1M, output ~$2.50/1M 기준)
+LLM_COST_PER_FILE_USD = 0.0029
 
 
 def run_survey(sp_client: "SharePointClient", config: dict, output_dir: Path) -> int:
@@ -74,7 +75,7 @@ def run_survey(sp_client: "SharePointClient", config: dict, output_dir: Path) ->
     print(f"    LLM 처리 대상    : {supported_count:,} 파일")
     print(f"    OCR 처리 대상    : {ocr_files:,} 파일  (PDF + 이미지)")
     print(f"    예상 처리 시간   : {_format_duration(est_seconds)}")
-    print(f"    예상 LLM 비용    : ${est_cost:,.2f}  (GPT-4.1-mini 기준)")
+    print(f"    예상 LLM 비용    : ${est_cost:,.2f}  (Gemini 2.5 Flash 기준)")
     print("=" * 72)
     print()
 

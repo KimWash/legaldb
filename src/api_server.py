@@ -146,6 +146,10 @@ def _record_to_dict(ar: Any) -> dict:
         "suggested_file_name": n.suggested_file_name or r.original_file_name,
         "suggested_full_path": n.suggested_full_path or "",
         "doc_type": n.extracted_doc_type or "",
+        "document_title": n.extracted_document_title or "",
+        "original_title": n.extracted_original_title or "",
+        "revision_note": n.revision_note or "",
+        "extracted_date": n.extracted_date or "",
         "summary": n.extracted_summary or "",
         "confidence": round(n.confidence, 3),
         "rename_status": n.rename_status or "",
@@ -1003,6 +1007,23 @@ async def rollback_files(req: RollbackRequest):
         )
     )
     return result
+
+
+# ── LLM diagnostics ───────────────────────────────────────────────────
+
+@app.post("/api/llm/test")
+async def llm_test():
+    """Gemini API 키/모델 연결을 점검한다. (UI '키 테스트' 버튼용)"""
+    loop = asyncio.get_event_loop()
+
+    def _work():
+        try:
+            client = OllamaClient(_config, PROJECT_ROOT)
+            return client.test_connection()
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    return await loop.run_in_executor(None, _work)
 
 
 # ── SharePoint diagnostics ────────────────────────────────────────────

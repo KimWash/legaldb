@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>법무 문서 DB 파일명 자동화</title>
+  <link rel="stylesheet" href="style.css?v=9">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%230f2040'><path d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'/><polyline points='14 2 14 8 20 8' fill='none' stroke='white' stroke-width='2'/></svg>">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="header-inner">
+    <div class="header-logo">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="16" y1="13" x2="8" y2="13"/>
+        <line x1="16" y1="17" x2="8" y2="17"/>
+      </svg>
+    </div>
+    <div>
+      <h1 class="header-title">법무 문서 DB 파일명 자동화</h1>
+      <p class="header-sub">SharePoint Legal Document Rename System</p>
+    </div>
+    <div class="header-badges">
+      <span class="hbadge hbadge-poc">POC</span>
+      <span id="hbadge-sp" class="hbadge hbadge-connected hidden">
+        <span class="hbadge-dot"></span>SharePoint 연결됨
+      </span>
+    </div>
+  </div>
+</header>
+
+<!-- Stepper -->
+<div class="stepper-wrap">
+  <div class="stepper">
+    <div class="step-item active" id="step-1">
+      <div class="step-num">1</div>
+      <div class="step-label">사이트 조회</div>
+    </div>
+    <div class="step-item" id="step-2">
+      <div class="step-num">2</div>
+      <div class="step-label">사전 점검</div>
+    </div>
+    <div class="step-item" id="step-3">
+      <div class="step-num">3</div>
+      <div class="step-label">AI 분석</div>
+    </div>
+    <div class="step-item" id="step-4">
+      <div class="step-num">4</div>
+      <div class="step-label">검토 / 확정</div>
+    </div>
+    <div class="step-item" id="step-5">
+      <div class="step-num">5</div>
+      <div class="step-label">변경 / 롤백</div>
+    </div>
+  </div>
+</div>
+
+<main class="app-main">
+
+  <!-- Step 1: URL Input -->
+  <section id="sec-input" class="card">
+    <div class="card-header">
+      <span class="step-badge">1</span>
+      <h2>SharePoint 사이트 조회</h2>
+    </div>
+    <div class="card-body">
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="site-url">사이트 URL</label>
+          <input id="site-url" type="url" placeholder="https://company.sharepoint.com/sites/LegalDB" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="root-folder">루트 폴더</label>
+          <input id="root-folder" type="text" value="법무DB" readonly>
+        </div>
+        <div class="form-group form-group--full">
+          <label for="folder-sharing-url">폴더 공유 URL <span class="optional">(선택 — 없으면 AllSites.Read 권한으로 자동 조회)</span></label>
+          <div class="input-row">
+            <input id="folder-sharing-url" type="url" placeholder="https://company.sharepoint.com/:f:/s/사이트명/Abc123...?e=xxxxx" autocomplete="off">
+            <button type="button" class="btn btn-sm btn-ghost" id="btn-test-sharing-url" onclick="testSharingUrl()">연결 테스트</button>
+          </div>
+          <div id="sharing-url-test-result" class="sharing-url-test-result hidden"></div>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button id="btn-survey" type="button" class="btn btn-primary" onclick="startSurvey()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          현황 조회
+        </button>
+        <div id="survey-cache-bar" class="survey-cache-bar hidden">
+          <span id="survey-last-scanned" class="survey-last-scanned"></span>
+          <button type="button" class="btn btn-sm" id="btn-delta-refresh" onclick="startDeltaRefresh()">🔄 새로고침</button>
+        </div>
+      </div>
+      <div id="delta-summary" class="delta-summary hidden"></div>
+      <p id="auth-hint" class="hint hidden">
+        인증이 필요한 경우 터미널 창에 표시된 코드로 로그인하세요.
+      </p>
+    </div>
+  </section>
+
+  <!-- Scanning Progress -->
+  <section id="sec-scanning" class="card hidden">
+    <div class="card-body scanning-body">
+      <div class="spinner"></div>
+      <div class="scanning-info">
+        <p class="scanning-stage" id="scan-stage">연결 중...</p>
+        <p class="scanning-folder" id="scan-folder"></p>
+        <div class="scanning-stats">
+          <span>파일 <strong id="scan-count">0</strong>개</span>
+          <span class="scanning-sep">·</span>
+          <span>폴더 <strong id="scan-folders">0</strong>개</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Survey Results -->
+  <section id="sec-results" class="hidden">
+
+    <div class="card sec-results-header">
+      <div class="card-header">
+        <span class="step-badge">2</span>
+        <h2>사전 점검</h2>
+        <span class="results-site-url" id="result-site-url"></span>
+      </div>
+    </div>
+
+    <!-- Stat Cards -->
+    <div class="stat-grid">
+      <div class="stat-card stat-card--navy">
+        <div class="stat-icon-row">
+          <div class="stat-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+          </div>
+          <span class="stat-tag">TOTAL</span>
+        </div>
+        <div class="stat-value" id="stat-total">—</div>
+        <div class="stat-label">총 파일 수</div>
+      </div>
+      <div class="stat-card stat-card--navy">
+        <div class="stat-icon-row">
+          <div class="stat-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+            </svg>
+          </div>
+          <span class="stat-tag">SIZE</span>
+        </div>
+        <div class="stat-value" id="stat-size">—</div>
+        <div class="stat-label">총 크기</div>
+      </div>
+      <div class="stat-card stat-card--green">
+        <div class="stat-icon-row">
+          <div class="stat-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+          <span class="stat-tag">READY</span>
+        </div>
+        <div class="stat-value" id="stat-supported">—</div>
+        <div class="stat-label">처리 가능</div>
+      </div>
+      <div class="stat-card stat-card--red">
+        <div class="stat-icon-row">
+          <div class="stat-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
+            </svg>
+          </div>
+          <span class="stat-tag">SKIP</span>
+        </div>
+        <div class="stat-value" id="stat-unsupported">—</div>
+        <div class="stat-label">처리 불가</div>
+      </div>
+    </div>
+
+    <!-- Two-column: Extensions + Folder Tree -->
+    <div class="results-columns">
+
+      <div class="card">
+        <div class="card-header">
+          <h3>확장자별 파일 수</h3>
+        </div>
+        <div class="card-body no-pad">
+          <table class="ext-table">
+            <colgroup>
+              <col class="col-ext-name">
+              <col class="col-ext-cnt">
+              <col class="col-ext-sup">
+            </colgroup>
+            <thead>
+              <tr><th>확장자</th><th>파일 수</th><th>지원</th></tr>
+            </thead>
+            <tbody id="ext-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>폴더 구조</h3>
+          <span class="card-hint">직접 파일 / 하위 합계</span>
+        </div>
+        <div class="card-body">
+          <div id="folder-tree" class="folder-tree"></div>
+        </div>
+        <div class="scope-bar">
+          <span class="scope-bar-label">분석 범위:</span>
+          <span id="scope-sel-count" class="scope-count">미선택 (전체)</span>
+          <span id="scope-sel-hint" class="scope-hint">체크박스로 처리할 폴더를 선택하세요</span>
+          <span id="scope-summary" class="scope-summary hidden">
+            <span class="scope-sum-sep">|</span>
+            파일 <strong id="scope-sum-files">0</strong>개
+            <span id="scope-sum-size-wrap">
+              <span class="scope-sum-sep">·</span><strong id="scope-sum-size" class="scope-sum-size">0 B</strong>
+            </span>
+            <span id="scope-sum-detail">
+              <span class="scope-sum-sep">·</span>처리가능 <strong id="scope-sum-ready" class="scope-sum-ready">0</strong>
+              <span class="scope-sum-sep">·</span>처리불가 <strong id="scope-sum-skip" class="scope-sum-skip">0</strong>
+            </span>
+          </span>
+          <div class="scope-bar-actions">
+            <button type="button" class="btn btn-sm" onclick="selectAllFolders()">전체 선택</button>
+            <button type="button" class="btn btn-sm btn-ghost" onclick="clearFolderSelection()">선택 해제</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Cost Estimate -->
+    <div class="card card--cost">
+      <div class="card-header">
+        <h3>처리 비용 예측</h3>
+      </div>
+      <div class="card-body">
+        <div class="cost-grid">
+          <div class="cost-item">
+            <div class="cost-label">LLM 처리 대상</div>
+            <div class="cost-value" id="cost-llm">—</div>
+          </div>
+          <div class="cost-item">
+            <div class="cost-label">OCR 처리 대상</div>
+            <div class="cost-value" id="cost-ocr">—</div>
+          </div>
+          <div class="cost-item">
+            <div class="cost-label">예상 처리 시간</div>
+            <div class="cost-value" id="cost-time">—</div>
+          </div>
+          <div class="cost-item cost-item--highlight">
+            <div class="cost-label">예상 LLM 비용</div>
+            <div class="cost-value" id="cost-usd">—</div>
+          </div>
+        </div>
+        <p class="cost-note">Gemini 2.5 Flash 기준 · 파일당 평균 약 3.5초</p>
+      </div>
+    </div>
+
+    <!-- CTA -->
+    <div class="cta-row">
+      <button type="button" class="btn btn-primary btn-large" onclick="showAnalysisSection()">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polygon points="5 3 19 12 5 21 5 3"/>
+        </svg>
+        분석 시작
+      </button>
+      <span class="cta-hint">파일명 자동 분석 및 개선안 생성</span>
+    </div>
+
+  </section>
+
+  <!-- Phase 2: Analysis -->
+  <section id="sec-analysis" class="hidden">
+
+    <div class="card">
+      <div class="card-header">
+        <span class="step-badge">3</span>
+        <h2>AI 파일명 분석</h2>
+        <span id="analysis-status-badge" class="status-badge badge-idle">대기중</span>
+      </div>
+      <div class="card-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="analysis-max-files">최대 파일 수 <span class="optional">(0=전체)</span></label>
+            <input id="analysis-max-files" type="number" min="0" value="0">
+          </div>
+          <div class="form-group form-group--inline">
+            <label class="toggle-label">
+              <input id="analysis-fast" type="checkbox">
+              빠른 분석 모드 <span class="optional">(OCR/LLM 건너뜀)</span>
+            </label>
+            <label class="toggle-label toggle-label--warn">
+              <input id="analysis-clear-cache" type="checkbox">
+              캐시 삭제 후 실행 <span class="optional">(처음부터 재분석)</span>
+            </label>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button id="btn-analyze" type="button" class="btn btn-primary" onclick="startAnalysis()">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            분석 시작
+          </button>
+          <button id="btn-stop" type="button" class="btn btn-stop hidden" onclick="stopAnalysis()">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+            </svg>
+            분석 중단
+          </button>
+          <button id="btn-llm-test" type="button" class="btn btn-ghost" onclick="testLlmKey()" title="OpenAI API 키/모델 연결을 확인합니다">
+            🔑 API 키 테스트
+          </button>
+          <span class="cta-hint">선택한 SharePoint 사이트의 파일을 분석합니다.</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="sec-analysis-progress" class="card hidden">
+      <div class="card-header">
+        <h3>분석 진행</h3>
+        <span id="analysis-elapsed" class="card-hint">0초</span>
+        <div id="download-btns" class="download-btns hidden">
+          <a id="btn-dl-excel" href="/api/analyze/download/excel" download
+             class="btn btn-download">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            Excel
+          </a>
+          <button type="button" class="btn btn-download" onclick="downloadJSON()">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            JSON
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="progress-wrap">
+          <div class="progress-track">
+            <div id="analysis-progress-bar" class="progress-fill"></div>
+          </div>
+          <span id="analysis-progress-text" class="progress-text">0 / 0</span>
+        </div>
+        <div class="a-stats-row">
+          <div class="a-stat">
+            <div class="a-stat-val" id="a-stat-processed">0</div>
+            <div class="a-stat-lbl">완료</div>
+          </div>
+          <div class="a-stat">
+            <div class="a-stat-val a-stat-val--blue" id="a-stat-cache">0</div>
+            <div class="a-stat-lbl">캐시</div>
+          </div>
+          <div class="a-stat">
+            <div class="a-stat-val a-stat-val--amber" id="a-stat-review">0</div>
+            <div class="a-stat-lbl">검토필요</div>
+          </div>
+          <div class="a-stat">
+            <div class="a-stat-val a-stat-val--red" id="a-stat-errors">0</div>
+            <div class="a-stat-lbl">오류</div>
+          </div>
+        </div>
+        <div id="active-files-row" class="active-files-row hidden">
+          <span class="active-lbl">처리중:</span>
+          <span id="active-files" class="active-files"></span>
+        </div>
+        <div class="live-feed">
+          <table class="live-table">
+            <thead><tr>
+              <th class="col-seq">#</th>
+              <th>현재 파일명</th>
+              <th>제안 파일명</th>
+              <th class="col-conf">신뢰도</th>
+              <th class="col-status">상태</th>
+              <th>사유</th>
+            </tr></thead>
+            <tbody id="live-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Phase 3: Review + Rename + Rollback -->
+  <section id="sec-review" class="hidden">
+
+    <div class="card">
+      <div class="card-header">
+        <span class="step-badge">4</span>
+        <h2>검토 및 파일명 변경</h2>
+        <span id="review-hint" class="card-hint">0개 항목</span>
+      </div>
+      <div class="review-toolbar">
+        <label class="check-all-label">
+          <input type="checkbox" id="check-all" onchange="toggleSelectAll(this.checked)">
+          전체 선택
+        </label>
+        <div class="filter-group">
+          <label><input type="radio" name="r-filter" value="all" checked onchange="applyFilter()"> 전체</label>
+          <label><input type="radio" name="r-filter" value="auto" onchange="applyFilter()"> 자동승인</label>
+          <label><input type="radio" name="r-filter" value="review" onchange="applyFilter()"> 검토필요</label>
+          <label><input type="radio" name="r-filter" value="conflict" onchange="applyFilter()"> 중복</label>
+        </div>
+        <span id="selected-count" class="selected-count">0개 선택됨</span>
+      </div>
+      <div class="card-body no-pad">
+        <div class="review-table-wrap">
+          <table class="review-table">
+            <thead><tr>
+              <th class="col-check"><span class="sr-only">선택</span></th>
+              <th>현재 파일명</th>
+              <th>제안 파일명</th>
+              <th class="col-conf">신뢰도</th>
+              <th class="col-rstatus">상태</th>
+              <th>요약</th>
+            </tr></thead>
+            <tbody id="review-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Rollback — always visible, independent of survey results -->
+  <section id="sec-rollback" class="card">
+    <div class="card-header">
+      <span class="step-badge">5</span>
+      <h3>변경 이력 및 롤백</h3>
+      <button type="button" class="btn btn-sm btn-header-action" onclick="loadRollbackList()">새로고침</button>
+    </div>
+    <div class="card-body">
+      <div id="rollback-list" class="rollback-list">
+        <p class="empty-msg">롤백 파일이 없습니다.</p>
+      </div>
+      <div id="rollback-pagination" class="rollback-pagination hidden"></div>
+    </div>
+  </section>
+
+  <!-- Error Banner (inline, for auth/survey errors) -->
+  <div id="error-banner" class="error-banner hidden">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+    </svg>
+    <span id="error-msg"></span>
+  </div>
+
+</main>
+
+<!-- Sticky Bottom Action Bar -->
+<footer class="action-bar" id="action-bar">
+  <div class="action-bar-inner">
+    <div class="ab-stats">
+      <div class="ab-stat">
+        <span class="ab-dot ab-dot-total"></span>
+        <span class="ab-val" id="ab-total">—</span>
+        <span class="ab-lbl">전체</span>
+      </div>
+      <span class="ab-sep">|</span>
+      <div class="ab-stat">
+        <span class="ab-dot ab-dot-auto"></span>
+        <span class="ab-val" id="ab-auto">—</span>
+        <span class="ab-lbl">자동승인</span>
+      </div>
+      <span class="ab-sep">|</span>
+      <div class="ab-stat">
+        <span class="ab-dot ab-dot-review"></span>
+        <span class="ab-val" id="ab-review">—</span>
+        <span class="ab-lbl">검토필요</span>
+      </div>
+      <span class="ab-sep">|</span>
+      <div class="ab-stat">
+        <span class="ab-dot ab-dot-conflict"></span>
+        <span class="ab-val" id="ab-conflict">—</span>
+        <span class="ab-lbl">중복</span>
+      </div>
+      <span class="ab-sep">|</span>
+      <div class="ab-stat">
+        <span class="ab-dot ab-dot-error"></span>
+        <span class="ab-val" id="ab-error">—</span>
+        <span class="ab-lbl">오류</span>
+      </div>
+    </div>
+    <div class="ab-actions">
+      <a href="/api/analyze/download/excel" download class="btn btn-download">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        Excel 다운로드
+      </a>
+      <button type="button" class="btn btn-ghost" id="btn-deselect" onclick="toggleSelectAll(false)">선택 해제</button>
+      <button type="button" class="btn btn-primary" id="btn-rename" onclick="executeRename()" disabled>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
+        </svg>
+        선택 파일명 변경
+      </button>
+    </div>
+  </div>
+</footer>
+
+<!-- Toast Container -->
+<div id="toast-container" class="toast-container"></div>
+
+<!-- Confirm Modal -->
+<div id="confirm-modal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal-box">
+    <div class="modal-icon">↩</div>
+    <h3 class="modal-title">롤백 실행 확인</h3>
+    <p class="modal-desc">아래 이력으로 파일명을 원래대로 복원합니다.<br>이 작업은 되돌릴 수 없습니다.</p>
+    <div class="modal-file" id="modal-file-name"></div>
+    <div class="modal-scope-info" id="modal-scope-info"></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" id="modal-cancel">취소</button>
+      <button type="button" class="btn btn-danger" id="modal-confirm">롤백 실행</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=14"></script>
+</body>
+</html>

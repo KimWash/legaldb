@@ -25,6 +25,8 @@ HEADERS = [
     "timeline_summary", "lawyer_summary", "search_summary",
     "recommended_use", "review_priority", "review_priority_reason",
     "metadata_limitations", "needs_legal_review",
+    # 신규 파일명 슬롯 (맨 끝에 추가 — 기존 컬럼 폭 letter 정렬 보존)
+    "extracted_original_title", "revision_note",
 ]
 
 

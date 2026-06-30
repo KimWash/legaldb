@@ -40,11 +40,13 @@ class NamingResult:
     extracted_summary: str = ""
     document_abstract: str = ""
     extracted_document_title: str = ""
+    extracted_original_title: str = ""
     extracted_doc_type: str = ""
     extracted_case_name: str = ""
     extracted_institution: str = ""
     extracted_date: str = ""
     extracted_keyword: str = ""
+    revision_note: str = ""
     suggested_file_name: str = ""
     suggested_full_path: str = ""
     reason: str = ""
@@ -90,10 +92,12 @@ class AnalysisRecord:
             "extracted_summary": self.naming.extracted_summary,
             "document_abstract": self.naming.document_abstract,
             "extracted_document_title": self.naming.extracted_document_title,
+            "extracted_original_title": self.naming.extracted_original_title,
             "extracted_case_name": self.naming.extracted_case_name,
             "extracted_institution": self.naming.extracted_institution,
             "extracted_date": self.naming.extracted_date,
             "extracted_keyword": self.naming.extracted_keyword,
+            "revision_note": self.naming.revision_note,
             "suggested_file_name": self.naming.suggested_file_name,
             "suggested_full_path": self.naming.suggested_full_path,
             "manually_edited": "✓" if self.naming.manually_edited else "",

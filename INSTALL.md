@@ -42,6 +42,30 @@
 - Windows 11에 기본 설치되어 있으므로 별도 설치 불필요
 - SharePoint 자동 로그인에 사용됨
 
+### 1-5. (선택) Intel OCR 가속 — Arc GPU / NPU
+
+`config.yaml`의 `ocr.engine: "accelerated"` 사용 시 OpenVINO + RapidOCR로 Intel Ultra 7 155H의
+**Arc GPU → NPU → CPU** 순으로 OCR을 가속합니다. **미설치/미지원 환경에서는 자동으로 Tesseract로 폴백**하므로 선택 사항입니다.
+
+1. 패키지 설치 (requirements.txt에 포함됨):
+   ```
+   pip install openvino rapidocr-openvino
+   ```
+2. GPU/NPU 사용을 위한 드라이버:
+   - **Arc GPU**: 최신 Intel Graphics Driver 설치 → OpenVINO가 `GPU` 디바이스로 인식
+   - **NPU**: Intel NPU(AI Boost) 드라이버 설치 → OpenVINO가 `NPU` 디바이스로 인식
+   - 디바이스 인식 확인:
+     ```
+     python -c "import openvino as ov; print(ov.Core().available_devices)"
+     → ['CPU', 'GPU', 'NPU']  (설치된 장치만 표시)
+     ```
+3. 한국어 인식 모델: RapidOCR 한국어 모델이 필요하며, 최초 실행 시 자동 다운로드되거나
+   `ocr.accelerated.lang: "korean"` 설정에 맞는 모델을 사용합니다.
+4. 가속을 끄고 기존 Tesseract만 쓰려면 `config.yaml`에서 `ocr.engine: "tesseract"`로 변경하세요.
+
+> 실행 로그에 `[ocr_accelerated] engine ready backend=... device=GPU` 가 보이면 가속이 활성화된 것입니다.
+> `unavailable` 메시지가 보이면 Tesseract로 폴백되며 결과 품질에는 영향이 없습니다.
+
 ---
 
 ## 2. 프로젝트 파일 복사
@@ -83,10 +107,12 @@ pip show fastapi openpyxl pytesseract ocrmypdf
 프로젝트 루트에 `.env` 파일을 생성하고 아래 내용을 입력합니다.
 
 ```
-OPENAI_API_KEY=<OpenAI API 키>
+GEMINI_API_KEY=<Google Gemini API 키>
 SP_EMAIL=<본인 회사 이메일>@poscointl.com
 SP_PASSWORD=<본인 회사 비밀번호>
 ```
+
+> Gemini API 키는 https://aistudio.google.com/apikey 에서 발급합니다. (`GOOGLE_API_KEY`로도 인식됨)
 
 > **주의:** 이 파일은 절대 외부에 공유하지 마세요.
 
@@ -168,6 +194,18 @@ where tesseract
 - `.env` 파일의 이메일/비밀번호 확인
 - 회사 VPN 연결 여부 확인
 - `temp/sp_token_cache.json` 삭제 후 재시도
+
+### Gemini API 키가 동작하는지 확인
+
+LLM(파일명 분석)이 키 오류 시 **조용히 추론 폴백**으로 동작하므로, 먼저 키를 직접 테스트하세요.
+
+- **CLI**:
+  ```
+  python src/llm_client.py
+  ```
+  성공 시 `✅ 연결 성공`, 실패 시 `❌ 실패: 인증/권한 실패(400)...` 등 원인을 출력합니다.
+- **웹 UI**: 3단계 'AI 파일명 분석' 카드의 **🔑 API 키 테스트** 버튼 → 토스트로 성공/실패 표시.
+- 키는 `.env`의 `GEMINI_API_KEY`, 모델/엔드포인트는 `config.yaml`의 `llm.gemini.model` / `base_url`을 확인하세요.
 
 ### `pip install` 중 오류
 

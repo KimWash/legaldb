@@ -1572,3 +1572,14 @@ details[open] > summary .tree-chevron { transform: rotate(90deg); }
   flex-shrink: 0;
 }
 .ab-actions .btn { height: 38px; }
+
+/* ── Review Table Pagination ────────────────────────────────────────── */
+.review-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--slate-100);
+  background: #fff;
+}

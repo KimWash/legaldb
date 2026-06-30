@@ -41,7 +41,7 @@ def execute_rename(
     if sp_client is None and approved_rows:
         first_sp_id = str(approved_rows[0].get("sharepoint_item_id") or "").strip()
         if first_sp_id:
-            raise SystemExit(
+            raise ValueError(
                 "[rename] SharePoint 파일이 감지되었으나 --source sharepoint 옵션이 없습니다.\n"
                 "  올바른 명령: python src/main.py --mode rename --source sharepoint --review-file <파일>"
             )
@@ -140,6 +140,19 @@ def execute_rename(
     # - 429 발생 시 retry-after 헤더 값만큼 대기 후 재시도
     BATCH_SIZE = 20
 
+    def _resolve_item_drive_id(row: dict) -> str:
+        """Per-item drive_id 결정: sharepoint_drive_id 필드 → web_url 파생 → config 기본값 순."""
+        drive_id = str(row.get("sharepoint_drive_id") or "").strip()
+        if drive_id:
+            return drive_id
+        web_url = str(row.get("sharepoint_web_url") or "").strip()
+        if web_url and sp_client is not None:
+            try:
+                return sp_client.resolve_drive_for_web_url(web_url)
+            except Exception:
+                pass
+        return ""  # batch_rename_items falls back to _resolve_drive() when empty
+
     if sp_pending and sp_client is not None:
         # 20개씩 청크로 분할
         for chunk_start in range(0, len(sp_pending), BATCH_SIZE):
@@ -152,6 +165,7 @@ def execute_rename(
                 {
                     "item_id": str(row.get("sharepoint_item_id") or "").strip(),
                     "new_name": Path(str(row.get("suggested_full_path") or "")).name,
+                    "drive_id": _resolve_item_drive_id(row),
                 }
                 for row in chunk
             ]
@@ -183,16 +197,19 @@ def execute_rename(
                     continue
 
                 # 결과를 map에 저장하되, 429(Throttled)인 것은 다음 시도를 위해 pending_items로 남겨둠
-                next_pending = []
                 throttled_results = []
                 for r in current_results:
                     if r["status"] == 429:
                         throttled_results.append(r)
-                        next_pending.append({"item_id": r["item_id"], "new_name": r["new_name"]})
                     else:
                         final_results_map[r["item_id"]] = r
 
-                pending_items = next_pending
+                # drive_id를 보존하며 다음 재시도 대기열 재구성
+                drive_id_map = {pi["item_id"]: pi.get("drive_id", "") for pi in pending_items}
+                pending_items = [
+                    {"item_id": r["item_id"], "new_name": r["new_name"], "drive_id": drive_id_map.get(r["item_id"], "")}
+                    for r in throttled_results
+                ]
 
                 if pending_items:
                     wait_sec = max((r["retry_after"] or 10) for r in throttled_results)
@@ -201,8 +218,10 @@ def execute_rename(
 
             # 배치 결과를 chunk 순서에 맞게 results에 반영
             for row in chunk:
-                original_path = Path(str(row.get("original_full_path") or ""))
-                target_path = Path(str(row.get("suggested_full_path") or ""))
+                # SP 경로는 Graph API에서 / 슬래시로 오므로 Path() 변환 없이 원본 문자열 보존.
+                # Path() 거치면 Windows에서 역슬래시로 바뀌어 프론트의 original_full_path와 불일치.
+                original_path_str = str(row.get("original_full_path") or "")
+                target_path_str = str(row.get("suggested_full_path") or "")
                 sp_item_id = str(row.get("sharepoint_item_id") or "").strip()
 
                 br = final_results_map.get(sp_item_id, {})
@@ -211,10 +230,10 @@ def execute_rename(
                     reason = "파일명 변경 완료 (SharePoint Batch)"
                     rollback_items.append({
                         "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "original_full_path": str(original_path),
-                        "new_full_path": str(target_path),
-                        "original_file_name": original_path.name,
-                        "new_file_name": br.get("new_name", target_path.name),
+                        "original_full_path": original_path_str,
+                        "new_full_path": target_path_str,
+                        "original_file_name": Path(original_path_str).name,
+                        "new_file_name": br.get("new_name", Path(target_path_str).name),
                         "sharepoint_item_id": sp_item_id,
                     })
                 else:
@@ -223,8 +242,8 @@ def execute_rename(
 
                 results.append({
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "original_full_path": str(original_path),
-                    "new_full_path": str(target_path),
+                    "original_full_path": original_path_str,
+                    "new_full_path": target_path_str,
                     "sharepoint_item_id": sp_item_id,
                     "status": status,
                     "reason": reason,
@@ -232,8 +251,8 @@ def execute_rename(
                 if progress_callback:
                     try:
                         progress_callback({
-                            "original_full_path": str(original_path),
-                            "new_full_path": str(target_path),
+                            "original_full_path": original_path_str,
+                            "new_full_path": target_path_str,
                             "status": status,
                             "reason": reason,
                         })

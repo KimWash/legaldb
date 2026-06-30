@@ -13,7 +13,7 @@ HEADERS = [
     "extracted_date", "extracted_keyword", "suggested_file_name", "suggested_full_path", "manually_edited",
     "reason", "confidence", "needs_manual_review", "approval", "reviewer_comment",
     "rename_status", "rollback_name",
-    "sharepoint_item_id", "sharepoint_web_url",
+    "sharepoint_item_id", "sharepoint_web_url", "sharepoint_drive_id",
     # Legal metadata (Excel only)
     "case_name_normalized", "case_alias", "case_type", "dispute_type",
     "document_category", "document_type_normalized", "procedure_stage",

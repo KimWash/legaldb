@@ -49,6 +49,7 @@ class SharePointClient:
         if not self._ssl_verify:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        self._drive_id_cache: dict[str, str] = {}  # site_url → drive_id
         self._msal_app = self._build_msal_app()
 
     # ------------------------------------------------------------------
@@ -219,13 +220,39 @@ class SharePointClient:
             "사이트 URL을 입력하거나 folder_sharing_url을 설정하세요."
         )
 
-    def _resolve_drive_via_sp_rest(self) -> str:
+    def resolve_drive_for_web_url(self, web_url: str) -> str:
+        """Resolve drive_id from a SharePoint item's webUrl. Result is cached per site URL.
+
+        Extracts the site URL from the item webUrl and resolves the drive_id for that site,
+        so rename operations always target the correct drive regardless of the current config.
+        """
+        m = re.match(r'(https://[^/]+(?:/sites/[^/?#]+)?)', web_url)
+        if not m:
+            return self._resolve_drive()
+        site_url = m.group(1).rstrip("/")
+
+        if site_url in self._drive_id_cache:
+            return self._drive_id_cache[site_url]
+
+        try:
+            drive_id = self._resolve_drive_via_sp_rest(site_url)
+            self._drive_id_cache[site_url] = drive_id
+            site_label = site_url.rstrip("/").rsplit("/", 1)[-1]
+            print(f"[sharepoint] drive_id 확인 (web URL 파생, {site_label}): {drive_id[:16]}...")
+            return drive_id
+        except Exception as exc:
+            print(f"[sharepoint] web URL에서 drive_id 해석 실패: {exc}")
+            return self._resolve_drive()
+
+    def _resolve_drive_via_sp_rest(self, site_url: str | None = None) -> str:
         """SharePoint REST API /_api/v2.1/drives 로 드라이브 ID를 조회합니다.
 
         AllSites.Read (SharePoint 위임 권한) 범위의 토큰을 사용합니다.
         동일 MSAL 앱에서 리프레시 토큰으로 무인(silent) 취득을 시도합니다.
+        site_url: 조회할 사이트 URL. None이면 self.site_url 사용.
         """
-        parsed = urlparse(self.site_url)
+        effective_url = (site_url or self.site_url).rstrip("/")
+        parsed = urlparse(effective_url)
         hostname = parsed.netloc          # e.g. poscointl1.sharepoint.com
         site_path = parsed.path.rstrip("/")  # e.g. /sites/DB2
 
@@ -565,13 +592,17 @@ class SharePointClient:
     # Download / rename
     # ------------------------------------------------------------------
 
-    def download_file(self, item_id: str, item_name: str, dest_dir: Path) -> Path:
+    def download_file(self, item_id: str, item_name: str, dest_dir: Path,
+                      web_url: str = "", drive_id: str = "") -> Path:
         """Download a drive item to dest_dir. Returns the local file path.
 
         Uses item_id as a stable cache key: if the temp file already exists
         it is returned immediately without re-downloading.
+        drive_id / web_url: if provided, used instead of _resolve_drive() to
+        target the correct SharePoint site (avoids cross-site 404).
         """
-        drive_id = self._resolve_drive()
+        if not drive_id:
+            drive_id = self.resolve_drive_for_web_url(web_url) if web_url else self._resolve_drive()
         suffix = Path(item_name).suffix or ".tmp"
         dest = dest_dir / f"sp_{item_id[:20]}{suffix}"
         if dest.exists():
@@ -804,11 +835,12 @@ class SharePointClient:
         drive_id = self._resolve_drive()
 
         # Build the $batch request body — relative URLs as required by the spec.
+        # Use per-item drive_id if provided (resolves cross-site rename issues).
         batch_requests = [
             {
                 "id": str(idx),
                 "method": "PATCH",
-                "url": f"/drives/{drive_id}/items/{item['item_id']}",
+                "url": f"/drives/{item.get('drive_id') or drive_id}/items/{item['item_id']}",
                 "headers": {"Content-Type": "application/json"},
                 "body": {"name": item["new_name"]},
             }

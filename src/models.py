@@ -20,6 +20,7 @@ class FileRecord:
     # SharePoint-specific fields (empty string when using local filesystem)
     sharepoint_item_id: str = ""
     sharepoint_web_url: str = ""
+    sharepoint_drive_id: str = ""  # parentReference.driveId from MS Graph
 
 
 @dataclass
@@ -110,6 +111,7 @@ class AnalysisRecord:
             "rollback_name": self.naming.rollback_name,
             "sharepoint_item_id": self.file_record.sharepoint_item_id,
             "sharepoint_web_url": self.file_record.sharepoint_web_url,
+            "sharepoint_drive_id": self.file_record.sharepoint_drive_id,
             # ── Legal metadata ──────────────────────────────────────────
             "case_name_normalized":   _fmt_meta(m.get("case_name_normalized")),
             "case_alias":             _fmt_meta(m.get("case_alias")),

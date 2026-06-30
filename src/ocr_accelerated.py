@@ -123,9 +123,21 @@ def is_available(config: dict) -> bool:
     return engine is not None and backend != "unavailable"
 
 
-def _run_engine_on_image(engine, image) -> tuple[str, float]:
+def _run_engine_on_image(engine, image, max_dim_limit: int = 1536) -> tuple[str, float]:
     """Run RapidOCR on a BGR/RGB numpy image. Returns (text, mean_conf_0_100)."""
     # Removed global _INFERENCE_LOCK to allow concurrent inference on thread-local engines
+    import cv2
+    if image is not None and hasattr(image, "shape"):
+        h, w = image.shape[:2]
+        max_dim = max(h, w)
+        if max_dim_limit > 0 and max_dim > max_dim_limit:
+            scale = max_dim_limit / max_dim
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            tid = threading.get_ident()
+            print(f"[ocr_accelerated][Thread-{tid}] Image resized from {w}x{h} to {new_w}x{new_h} (max_dim_limit={max_dim_limit})")
+
     output = engine(image)
     # rapidocr_openvino: returns (result, elapse); result = [[box, text, score], ...] or None
     # rapidocr 2.x: returns an object with .txts / .scores
@@ -162,7 +174,8 @@ def ocr_image_array(image, config: dict) -> tuple[str, float] | None:
     if engine is None or backend == "unavailable":
         return None
     try:
-        return _run_engine_on_image(engine, image)
+        limit = int(config.get("max_dim", 1536)) if config else 1536
+        return _run_engine_on_image(engine, image, max_dim_limit=limit)
     except Exception as exc:
         print(f"[ocr_accelerated] image OCR failed ({exc}); will fall back.")
         return None
@@ -188,6 +201,7 @@ def run_accelerated_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_se
     dpi = int(config.get("dpi", 300))
     min_len = int(config.get("min_len", 40))
     preprocess = bool(config.get("preprocess", False))
+    max_dim_limit = int(config.get("max_dim", 1536))
 
     try:
         total_pages = _get_pdf_page_count(pdf_path)
@@ -210,7 +224,7 @@ def run_accelerated_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_se
             break
         img = _preprocess_image(image) if preprocess else image
         try:
-            text, conf = _run_engine_on_image(engine, img)
+            text, conf = _run_engine_on_image(engine, img, max_dim_limit=max_dim_limit)
         except Exception as exc:
             text, conf = "", 0.0
             print(f"[ocr_accelerated] page {page_no} OCR failed: {exc}")

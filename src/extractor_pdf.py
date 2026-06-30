@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 import io
+import logging
 import os
 import re
 import sys
@@ -13,6 +14,38 @@ from models import ExtractionResult
 from ocr_advanced import run_advanced_ocr
 from ocr_accelerated import run_accelerated_ocr
 from ocr_runner import run_ocrmypdf
+
+# Suppress pypdf warnings and logger warnings for advanced encodings
+warnings.filterwarnings("ignore", message=".*Advanced encoding.*")
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+# Patch pypdf to support common Korean and Japanese PDF encodings (CMaps)
+try:
+    import pypdf._cmap
+    pypdf._cmap._predefined_cmap.update({
+        "/UniKS-UTF16-H": "utf-16-be",
+        "/UniKS-UTF16-V": "utf-16-be",
+        "/UniKS-UCS2-H": "utf-16-be",
+        "/UniKS-UCS2-V": "utf-16-be",
+        "/KSC-EUC-H": "euc-kr",
+        "/KSC-EUC-V": "euc-kr",
+        "/KSCms-UHC-H": "cp949",
+        "/KSCms-UHC-V": "cp949",
+        "/KSCms-UHC-HW-H": "cp949",
+        "/KSCms-UHC-HW-V": "cp949",
+        "/UniJIS-UTF16-H": "utf-16-be",
+        "/UniJIS-UTF16-V": "utf-16-be",
+        "/UniJIS-UCS2-H": "utf-16-be",
+        "/UniJIS-UCS2-V": "utf-16-be",
+        "/90ms-RKSJ-H": "cp932",
+        "/90ms-RKSJ-V": "cp932",
+        "/90msp-RKSJ-H": "cp932",
+        "/EUC-H": "euc-jp",
+        "/EUC-V": "euc-jp",
+    })
+except Exception:
+    pass
+
 
 
 def _read_pdf_text(path: Path, max_chars: int = 8000) -> tuple[str, int]:

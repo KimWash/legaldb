@@ -38,6 +38,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 롤백 이력은 항상 로드 (현황 조회 여부와 무관)
   loadRollbackList();
+
+  // 진행 중이거나 완료된 분석 세션 복원
+  await restoreActiveAnalysisSession();
 });
 
 function _showCacheBar(scannedAt) {
@@ -589,6 +592,8 @@ let _cacheHits = 0;
 let _reviewCount = 0;
 let _errorCount  = 0;
 const LIVE_FEED_MAX = 150;
+let _reviewPage = 1;
+const REVIEW_PAGE_SIZE = 150;
 
 // ── Stepper ───────────────────────────────────────────────────────────
 function setStep(n) {
@@ -616,6 +621,86 @@ function updateActionBar(records) {
 }
 
 // ── Phase 2: Analysis ─────────────────────────────────────────────────
+async function restoreActiveAnalysisSession() {
+  try {
+    const res = await fetch('/api/analyze/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.status === 'running' || data.status === 'scanning') {
+      _analysisSiteUrl          = data.site_url || '';
+      _analysisRootFolder       = data.root_folder || '';
+      _analysisFolderSharingUrl = data.folder_sharing_url || '';
+
+      // UI 및 Stepper 복원
+      setStep(3);
+      $('sec-analysis').classList.remove('hidden');
+      $('sec-analysis-progress').classList.remove('hidden');
+      $('btn-analyze').classList.add('hidden');
+      $('btn-stop').classList.remove('hidden');
+      $('live-tbody').innerHTML = '';
+      _liveFeedCount = 0;
+      _allRecords    = [];
+      _filteredRecords = [];
+      _selectedSeqs.clear();
+      _cacheHits     = data.cache_hits || 0;
+      _reviewCount   = data.manual_review || 0;
+      _errorCount    = data.errors || 0;
+
+      updateAnalysisStats(data.processed || 0, _cacheHits, _reviewCount, _errorCount);
+      updateAnalysisProgress(data.processed || 0, data.total || 0);
+
+      // 타이머 시작
+      _analysisStartTs = Date.now() - (data.elapsed * 1000);
+      if (_elapsedInterval) clearInterval(_elapsedInterval);
+      _elapsedInterval = setInterval(() => {
+        const sec = Math.round((Date.now() - _analysisStartTs) / 1000);
+        $('analysis-elapsed').textContent = sec < 60
+          ? sec + '초'
+          : Math.floor(sec / 60) + '분 ' + (sec % 60) + '초';
+      }, 1000);
+
+      // SSE 연결 복원
+      if (_analysisEs) _analysisEs.close();
+      _analysisEs = new EventSource('/api/analyze/stream');
+      _analysisEs.addEventListener('message', e => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch (_) { return; }
+        handleAnalysisEvent(msg);
+      });
+      _analysisEs.onerror = () => {
+        stopElapsed();
+        showError('분석 스트림 연결이 끊어졌습니다.');
+        $('btn-analyze').disabled = false;
+      };
+    } else if (data.status === 'complete') {
+      _analysisSiteUrl          = data.site_url || '';
+      _analysisRootFolder       = data.root_folder || '';
+      _analysisFolderSharingUrl = data.folder_sharing_url || '';
+
+      // 분석 완료 UI 복원
+      setStep(3);
+      $('sec-analysis').classList.remove('hidden');
+      $('sec-analysis-progress').classList.remove('hidden');
+      $('btn-analyze').disabled = false;
+      $('btn-analyze').classList.remove('hidden');
+      $('btn-stop').classList.add('hidden');
+      $('download-btns').classList.remove('hidden');
+      showResetButton();
+      setBadge('analysis-status-badge', 'complete', '완료');
+      updateAnalysisStats(data.processed || 0, data.cache_hits || 0, data.manual_review || 0, data.errors || 0);
+      updateAnalysisProgress(data.processed || 0, data.total || 0);
+
+      const resultsRes = await fetch('/api/analyze/results');
+      if (resultsRes.ok) {
+        const resData = await resultsRes.json();
+        showReviewSection(resData.records || []);
+      }
+    }
+  } catch (e) {
+    console.error("분석 상태 복원 오류:", e);
+  }
+}
+
 function showAnalysisSection() {
   _analysisSiteUrl          = $('site-url').value.trim();
   _analysisRootFolder       = $('root-folder').value.trim();
@@ -631,6 +716,7 @@ async function startAnalysis() {
   const clearCache  = $('analysis-clear-cache').checked;
 
   $('btn-analyze').disabled = true;
+  hideResetButton();
   setBadge('analysis-status-badge', 'scanning', '스캔중');
   $('sec-analysis-progress').classList.remove('hidden');
   $('live-tbody').innerHTML = '';
@@ -731,11 +817,11 @@ function handleAnalysisEvent(msg) {
       updateAnalysisStats(msg.processed, msg.cache_hits, _reviewCount, _errorCount);
       if (msg.total > 0) updateAnalysisProgress(msg.processed, msg.total);
       if (msg.status === 'complete') {
-        resetAnalysisButtons();
+        resetAnalysisButtons(); showResetButton();
         $('download-btns').classList.remove('hidden');
         showReviewSection(msg.records || _allRecords);
       } else if (msg.status === 'cancelled') {
-        resetAnalysisButtons();
+        resetAnalysisButtons(); showResetButton();
         setBadge('analysis-status-badge', 'idle', '중단됨');
       } else if (msg.status === 'running' || msg.status === 'scanning') {
         $('btn-analyze').classList.add('hidden');
@@ -771,7 +857,7 @@ function handleAnalysisEvent(msg) {
     case 'complete':
       _analysisEs.close();
       stopElapsed();
-      resetAnalysisButtons();
+      resetAnalysisButtons(); showResetButton();
       setBadge('analysis-status-badge', 'complete', '완료');
       updateAnalysisStats(msg.processed, msg.cache_hits, msg.manual_review, msg.errors);
       updateAnalysisProgress(msg.processed, msg.total);
@@ -787,7 +873,7 @@ function handleAnalysisEvent(msg) {
     case 'cancelled':
       _analysisEs.close();
       stopElapsed();
-      resetAnalysisButtons();
+      resetAnalysisButtons(); showResetButton();
       setBadge('analysis-status-badge', 'idle', '중단됨');
       updateAnalysisProgress(msg.processed, msg.total);
       $('active-files-row').classList.add('hidden');
@@ -797,9 +883,26 @@ function handleAnalysisEvent(msg) {
     case 'error':
       _analysisEs.close();
       stopElapsed();
-      resetAnalysisButtons();
+      resetAnalysisButtons(); showResetButton();
       setBadge('analysis-status-badge', 'error', '오류');
       showError(msg.message || '분석 중 오류 발생');
+      break;
+
+    case 'reset':
+      // 다른 탭/클라이언트에서 리셋했을 때 동기화
+      if (_analysisEs) { _analysisEs.close(); _analysisEs = null; }
+      stopElapsed();
+      _allRecords = []; _filteredRecords = []; _selectedSeqs.clear();
+      hideResetButton();
+      $('btn-analyze').disabled = false;
+      $('btn-analyze').classList.remove('hidden');
+      $('btn-stop').classList.add('hidden');
+      setBadge('analysis-status-badge', 'idle', '대기중');
+      $('live-tbody').innerHTML = '';
+      $('sec-analysis-progress')?.classList.add('hidden');
+      $('sec-review')?.classList.add('hidden');
+      $('download-btns')?.classList.add('hidden');
+      setStep(3);
       break;
   }
 }
@@ -860,6 +963,54 @@ function resetAnalysisButtons() {
   $('btn-stop').classList.add('hidden');
   $('btn-stop').disabled = false;
   $('btn-stop').textContent = '분석 중단';
+}
+
+function showResetButton() {
+  $('btn-reset-analysis')?.classList.remove('hidden');
+}
+
+function hideResetButton() {
+  $('btn-reset-analysis')?.classList.add('hidden');
+}
+
+async function resetAnalysis() {
+  if (!confirm('분석 결과를 초기화하고 새로 시작하시겠습니까?')) return;
+  try {
+    const res = await fetch('/api/analyze/reset', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) { showError(data.error); return; }
+  } catch (e) {
+    showError('초기화 실패: ' + e.message); return;
+  }
+
+  // 분석 SSE 연결 종료
+  if (_analysisEs) { _analysisEs.close(); _analysisEs = null; }
+  if (_elapsedInterval) { clearInterval(_elapsedInterval); _elapsedInterval = null; }
+
+  // 상태 변수 초기화
+  _allRecords     = [];
+  _filteredRecords = [];
+  _selectedSeqs.clear();
+
+  // UI 초기화
+  hideResetButton();
+  $('btn-analyze').disabled = false;
+  $('btn-analyze').classList.remove('hidden');
+  $('btn-stop').classList.add('hidden');
+  setBadge('analysis-status-badge', 'idle', '대기중');
+  $('analysis-progress-bar').style.width = '0%';
+  $('analysis-progress-text').textContent = '0 / 0';
+  $('a-stat-processed').textContent = '0';
+  $('a-stat-cache').textContent     = '0';
+  $('a-stat-review').textContent    = '0';
+  $('a-stat-errors').textContent    = '0';
+  $('live-tbody').innerHTML         = '';
+  $('analysis-elapsed').textContent = '0초';
+  $('active-files-row')?.classList.add('hidden');
+  $('download-btns')?.classList.add('hidden');
+  $('sec-analysis-progress')?.classList.add('hidden');
+  $('sec-review')?.classList.add('hidden');
+  setStep(3);
 }
 
 async function stopAnalysis() {
@@ -1040,10 +1191,21 @@ function applyFilter() {
   }
 
   $('review-hint').textContent = _filteredRecords.length.toLocaleString('ko-KR') + '개 항목';
+  _reviewPage = 1;
+  renderReviewPage();
+}
+
+function renderReviewPage() {
+  const total = _filteredRecords.length;
+  const totalPages = Math.max(1, Math.ceil(total / REVIEW_PAGE_SIZE));
+  if (_reviewPage > totalPages) _reviewPage = totalPages;
+
+  const start = (_reviewPage - 1) * REVIEW_PAGE_SIZE;
+  const pageRecords = _filteredRecords.slice(start, start + REVIEW_PAGE_SIZE);
 
   const tbody = $('review-tbody');
   tbody.innerHTML = '';
-  for (const rec of _filteredRecords) {
+  for (const rec of pageRecords) {
     const checked = _selectedSeqs.has(rec.seq);
     const tr = document.createElement('tr');
     if (rec.needs_manual_review) tr.classList.add('row-review');
@@ -1057,7 +1219,59 @@ function applyFilter() {
       `<td class="cell-summary" title="${esc(rec.summary)}">${esc((rec.summary || '').slice(0, 60))}${(rec.summary || '').length > 60 ? '…' : ''}</td>`;
     tbody.appendChild(tr);
   }
+
+  // Pagination UI
+  const pagEl = $('review-pagination');
+  if (totalPages <= 1) {
+    pagEl.classList.add('hidden');
+    pagEl.innerHTML = '';
+  } else {
+    pagEl.classList.remove('hidden');
+    const prev = _reviewPage > 1;
+    const next = _reviewPage < totalPages;
+    let html = `<span class="pg-info">${total}개 중 ${start + 1}~${Math.min(start + REVIEW_PAGE_SIZE, total)}개 표시</span>`;
+    html += `<button type="button" class="pg-btn" ${prev ? '' : 'disabled'} onclick="goReviewPage(${_reviewPage - 1})">‹</button>`;
+
+    const maxVisiblePages = 5;
+    let startPage = Math.max(1, _reviewPage - Math.floor(maxVisiblePages / 2));
+    let endPage = startPage + maxVisiblePages - 1;
+    if (endPage > totalPages) {
+      endPage = totalPages;
+      startPage = Math.max(1, endPage - maxVisiblePages + 1);
+    }
+
+    if (startPage > 1) {
+      html += `<button type="button" class="pg-btn" onclick="goReviewPage(1)">1</button>`;
+      if (startPage > 2) html += `<span class="pg-info">...</span>`;
+    }
+
+    for (let p = startPage; p <= endPage; p++) {
+      html += `<button type="button" class="pg-btn${p === _reviewPage ? ' pg-btn--active' : ''}" onclick="goReviewPage(${p})">${p}</button>`;
+    }
+
+    if (endPage < totalPages) {
+      if (endPage < totalPages - 1) html += `<span class="pg-info">...</span>`;
+      html += `<button type="button" class="pg-btn" onclick="goReviewPage(${totalPages})">${totalPages}</button>`;
+    }
+
+    html += `<button type="button" class="pg-btn" ${next ? '' : 'disabled'} onclick="goReviewPage(${_reviewPage + 1})">›</button>`;
+    pagEl.innerHTML = html;
+  }
+
+  // Update check-all checkbox state based on _filteredRecords
+  const allChecked = _filteredRecords.length > 0 && _filteredRecords.every(r => _selectedSeqs.has(r.seq));
+  const someChecked = _selectedSeqs.size > 0;
+  $('check-all').checked = allChecked;
+  $('check-all').indeterminate = !allChecked && someChecked;
+
   updateSelectedCount();
+}
+
+function goReviewPage(page) {
+  _reviewPage = page;
+  renderReviewPage();
+  const wrap = document.querySelector('.review-table-wrap');
+  if (wrap) wrap.scrollTop = 0;
 }
 
 function toggleSelect(seq, checked) {
@@ -1074,6 +1288,10 @@ function toggleSelectAll(checked) {
   _filteredRecords.forEach(r => checked ? _selectedSeqs.add(r.seq) : _selectedSeqs.delete(r.seq));
   $('review-tbody').querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = checked; });
   updateSelectedCount();
+  const allChecked = _filteredRecords.length > 0 && _filteredRecords.every(r => _selectedSeqs.has(r.seq));
+  const someChecked = _selectedSeqs.size > 0;
+  $('check-all').checked = allChecked;
+  $('check-all').indeterminate = !allChecked && someChecked;
 }
 
 function updateSelectedCount() {
@@ -1139,6 +1357,7 @@ async function executeRename() {
           original_full_path:  r.original_full_path,
           suggested_full_path: r.suggested_full_path,
           sharepoint_item_id:  r.sharepoint_item_id || '',
+          sharepoint_web_url:  r.sharepoint_web_url || '',
           manually_edited:     r.manually_edited || false,
         })),
         site_url:           _analysisSiteUrl,

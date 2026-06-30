@@ -42,6 +42,7 @@ ocr:
     device_priority: ["GPU", "NPU", "CPU"]   # Arc GPU 우선 → NPU → CPU, 실패 시 다음으로 폴백
     lang: "korean"        # RapidOCR 인식 언어(한국어+영문)
     dpi: 200              # 300 -> 200 (메모리 절감)
+    max_dim: 1536         # 최대 이미지 dimension (1536 초과 시 scale down하여 OpenVINO OOM 방지)
     min_len: 40
     preprocess: false     # RapidOCR는 자체 전처리 포함 (true면 ocr_advanced 전처리 적용)
     timeout_seconds: 60

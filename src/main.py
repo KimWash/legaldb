@@ -399,7 +399,9 @@ def _analyze_single_record_inner(
         sem = sp_semaphore or BoundedSemaphore(1)
         with sem:
             local_file = sp_client.download_file(
-                record.sharepoint_item_id, record.original_file_name, sp_dl_dir
+                record.sharepoint_item_id, record.original_file_name, sp_dl_dir,
+                web_url=record.sharepoint_web_url,
+                drive_id=record.sharepoint_drive_id,
             )
         path = local_file
     else:
@@ -700,24 +702,58 @@ def rename_mode(
     except ModuleNotFoundError as exc:
         raise SystemExit(f"Missing dependency for Excel input: {exc}. Run `pip install -r requirements.txt`.") from exc
 
-    result = execute_rename(
-        review_rows=review_rows,
-        config=config,
-        logs_dir=resolve_project_path(project_root, config["logs"]["output_dir"]),
-        rollback_dir=resolve_project_path(project_root, config["rollback"]["output_dir"]),
-        sp_client=sp_client,
-    )
+    # Auto-initialize SharePoint client if SharePoint files are detected and sp_client is None
+    approved_rows = [r for r in review_rows if str(r.get("approval") or "").strip().upper() == "Y"]
+    has_sp = any(bool(str(r.get("sharepoint_item_id") or "").strip()) for r in approved_rows)
+    if has_sp and sp_client is None:
+        print("[rename] SharePoint 파일이 감지되었습니다. SharePoint 클라이언트를 초기화합니다...")
+        try:
+            sp_client = _build_sp_client(config, project_root)
+        except Exception as exc:
+            raise SystemExit(
+                f"[rename] SharePoint 클라이언트 초기화 실패: {exc}\n"
+                f"  config.yaml의 sharepoint 설정을 확인하거나 CLI 실행 시 --source sharepoint 옵션을 지정해 주세요."
+            )
+
+    try:
+        result = execute_rename(
+            review_rows=review_rows,
+            config=config,
+            logs_dir=resolve_project_path(project_root, config["logs"]["output_dir"]),
+            rollback_dir=resolve_project_path(project_root, config["rollback"]["output_dir"]),
+            sp_client=sp_client,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
 def rollback_mode(
+    config: dict,
+    project_root: Path,
     rollback_file: str | None,
     sp_client: SharePointClient | None = None,
 ) -> int:
     if not rollback_file:
         raise SystemExit("--rollback-file is required for rollback mode")
-    print(json.dumps(execute_rollback(Path(rollback_file), sp_client=sp_client), ensure_ascii=False, indent=2))
+
+    rollback_path = Path(rollback_file)
+    if not rollback_path.is_absolute():
+        rollback_path = (project_root / rollback_path).resolve()
+
+    if sp_client is None and rollback_path.exists():
+        try:
+            from rollback_executor import _load_rollback_items
+            items = _load_rollback_items(rollback_path)
+            has_sp = any(bool(str(it.get("sharepoint_item_id") or "").strip()) for it in items)
+            if has_sp:
+                print("[rollback] SharePoint 파일이 감지되었습니다. SharePoint 클라이언트를 초기화합니다...")
+                sp_client = _build_sp_client(config, project_root)
+        except Exception as exc:
+            print(f"[rollback] SharePoint 클라이언트 초기화 중 오류 발생: {exc}")
+
+    print(json.dumps(execute_rollback(rollback_path, sp_client=sp_client), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -772,7 +808,7 @@ def main() -> int:
         return analyze(config, project_root, args, sp_client=sp_client)
     if args.mode == "rename":
         return rename_mode(config, project_root, args.review_file, sp_client=sp_client)
-    return rollback_mode(args.rollback_file, sp_client=sp_client)
+    return rollback_mode(config, project_root, args.rollback_file, sp_client=sp_client)
 
 
 if __name__ == "__main__":

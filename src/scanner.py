@@ -56,6 +56,7 @@ def scan_sharepoint_files(client: "SharePointClient", config: dict) -> list[File
                 supported=supported,
                 sharepoint_item_id=item.get("id", ""),
                 sharepoint_web_url=item.get("webUrl", ""),
+                sharepoint_drive_id=item.get("parentReference", {}).get("driveId", ""),
             )
         )
     return records

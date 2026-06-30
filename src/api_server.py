@@ -78,26 +78,25 @@ _sp_cache: dict[str, SharePointClient] = {}
 # ── SharePoint client ─────────────────────────────────────────────────
 
 def _make_sp_client(site_url: str, root_folder: str, folder_sharing_url: str = "") -> SharePointClient:
-    cache_key = f"{site_url}|{root_folder}|{folder_sharing_url}"
+    cfg = _config.get("sharepoint", {})
+    url    = (site_url or cfg.get("site_url", "")).rstrip("/")
+    folder = root_folder or cfg.get("root_folder", "")
+    fsu    = folder_sharing_url or cfg.get("folder_sharing_url", "")
+    cache_key = f"{url}|{folder}|{fsu}"
+
     if cache_key in _sp_cache:
         return _sp_cache[cache_key]
-    sp_cfg = dict(_config.get("sharepoint", {}))
-    configured_url = sp_cfg.get("site_url", "").rstrip("/")
-    requested_url  = (site_url or "").rstrip("/")
-    if requested_url and requested_url != configured_url:
-        sp_cfg["site_url"] = site_url
+
+    sp_cfg = dict(cfg)
+    if url != cfg.get("site_url", "").rstrip("/"):
         sp_cfg.pop("drive_id", None)
-        # folder_sharing_url이 UI에서 제공된 경우 사용, 아니면 제거
-        if folder_sharing_url:
-            sp_cfg["folder_sharing_url"] = folder_sharing_url
-        else:
-            sp_cfg.pop("folder_sharing_url", None)
-    elif requested_url:
-        sp_cfg["site_url"] = site_url
-        if folder_sharing_url:
-            sp_cfg["folder_sharing_url"] = folder_sharing_url
-    if root_folder is not None:
-        sp_cfg["root_folder"] = root_folder
+    sp_cfg["site_url"] = url
+    sp_cfg["root_folder"] = folder
+    if fsu:
+        sp_cfg["folder_sharing_url"] = fsu
+    else:
+        sp_cfg.pop("folder_sharing_url", None)
+
     token_cache = resolve_project_path(
         PROJECT_ROOT, sp_cfg.get("token_cache_path", "./temp/sp_token_cache.json")
     )
@@ -112,7 +111,8 @@ def _get_sp_client(site_url: str = "", root_folder: str = "", folder_sharing_url
     url    = (site_url or cfg.get("site_url", "")).rstrip("/")
     folder = root_folder or cfg.get("root_folder", "")
     fsu    = folder_sharing_url or cfg.get("folder_sharing_url", "")
-    return _sp_cache.get(f"{url}|{folder}|{fsu}")
+    cache_key = f"{url}|{folder}|{fsu}"
+    return _sp_cache.get(cache_key)
 
 
 # ── Analysis session ──────────────────────────────────────────────────
@@ -132,6 +132,7 @@ class AnalysisSession:
     last_error: str = ""
     site_url: str = ""
     root_folder: str = ""
+    folder_sharing_url: str = ""
     cancelled: bool = False
 
 
@@ -139,6 +140,131 @@ _session = AnalysisSession()
 _session_lock = threading.Lock()
 _analysis_subs: list[asyncio.Queue] = []
 _main_loop: asyncio.AbstractEventLoop | None = None
+
+SESSION_STATE_PATH = PROJECT_ROOT / "temp" / "session_state.json"
+
+def _save_session_state() -> None:
+    try:
+        with _session_lock:
+            state = {
+                "site_url": _session.site_url,
+                "root_folder": _session.root_folder,
+                "folder_sharing_url": _session.folder_sharing_url,
+                "review_path": _session.review_path,
+                "status": _session.status if _session.status in ("complete", "idle") else "idle",
+                "total": _session.total,
+                "processed": _session.processed,
+                "cache_hits": _session.cache_hits,
+                "manual_review": _session.manual_review,
+                "errors": _session.errors,
+            }
+        SESSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[session] Failed to save session state: {exc}")
+
+def _load_session_state() -> None:
+    global _session
+    if not SESSION_STATE_PATH.exists():
+        return
+    try:
+        state = json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
+        with _session_lock:
+            _session.site_url = state.get("site_url", "")
+            _session.root_folder = state.get("root_folder", "")
+            _session.folder_sharing_url = state.get("folder_sharing_url", "")
+            _session.review_path = state.get("review_path", "")
+            _session.status = state.get("status", "idle")
+            _session.total = state.get("total", 0)
+            _session.processed = state.get("processed", 0)
+            _session.cache_hits = state.get("cache_hits", 0)
+            _session.manual_review = state.get("manual_review", 0)
+            _session.errors = state.get("errors", 0)
+
+        review_path = _session.review_path
+        if review_path and Path(review_path).exists():
+            try:
+                from excel_writer import read_review_rows
+                from models import FileRecord, ExtractionResult, NamingResult, AnalysisRecord
+                
+                rows = read_review_rows(Path(review_path))
+                
+                records = []
+                all_analysis_records = []
+                
+                for row in rows:
+                    rec_dict = {
+                        "seq": int(row.get("seq") or 0),
+                        "original_file_name": row.get("original_file_name") or "",
+                        "original_full_path": row.get("original_full_path") or "",
+                        "original_dir_path": row.get("original_folder") or "",
+                        "relative_path": row.get("relative_path") or "",
+                        "sharepoint_item_id": row.get("sharepoint_item_id") or "",
+                        "sharepoint_web_url": row.get("sharepoint_web_url") or "",
+                        "file_extension": row.get("file_extension") or "",
+                        "file_size": int(row.get("file_size") or 0),
+                        "suggested_file_name": row.get("suggested_file_name") or "",
+                        "suggested_full_path": row.get("suggested_full_path") or "",
+                        "doc_type": row.get("file_type") or "",
+                        "document_title": row.get("extracted_document_title") or "",
+                        "original_title": row.get("extracted_original_title") or "",
+                        "revision_note": row.get("revision_note") or "",
+                        "extracted_date": row.get("extracted_date") or "",
+                        "summary": row.get("extracted_summary") or "",
+                        "confidence": round(float(row.get("confidence") or 0.0), 3),
+                        "rename_status": row.get("rename_status") or "",
+                        "needs_manual_review": str(row.get("needs_manual_review") or "").strip().upper() == "Y" or bool(row.get("needs_manual_review")),
+                        "conflict_detected": str(row.get("conflict_detected") or "").strip().upper() == "Y" or bool(row.get("conflict_detected")),
+                        "reason": row.get("reason") or "",
+                    }
+                    records.append(rec_dict)
+                    
+                    fr = FileRecord(
+                        seq=rec_dict["seq"],
+                        root_path=_session.root_folder or "/",
+                        original_full_path=rec_dict["original_full_path"],
+                        original_dir_path=rec_dict["original_dir_path"],
+                        original_file_name=rec_dict["original_file_name"],
+                        file_extension=rec_dict["file_extension"],
+                        file_size=rec_dict["file_size"],
+                        last_modified_time="",
+                        relative_path_from_root=rec_dict["relative_path"],
+                        supported=True,
+                        sharepoint_item_id=rec_dict["sharepoint_item_id"],
+                        sharepoint_web_url=rec_dict["sharepoint_web_url"],
+                    )
+                    er = ExtractionResult(
+                        file_type=rec_dict["doc_type"],
+                        extraction_status="success",
+                        notes=[]
+                    )
+                    nr = NamingResult(
+                        suggested_file_name=rec_dict["suggested_file_name"],
+                        suggested_full_path=rec_dict["suggested_full_path"],
+                        confidence=rec_dict["confidence"],
+                        needs_manual_review=rec_dict["needs_manual_review"],
+                        reason=rec_dict["reason"],
+                        rename_status=rec_dict["rename_status"],
+                        rollback_name=row.get("rollback_name") or "",
+                        conflict_detected=rec_dict["conflict_detected"],
+                        manually_edited=str(row.get("manually_edited") or "").strip().upper() == "Y" or bool(row.get("manually_edited")),
+                        extracted_doc_type=rec_dict["doc_type"],
+                        extracted_document_title=rec_dict["document_title"],
+                        extracted_original_title=rec_dict["original_title"],
+                        revision_note=rec_dict["revision_note"],
+                        extracted_date=rec_dict["extracted_date"],
+                        extracted_summary=rec_dict["summary"],
+                    )
+                    all_analysis_records.append(AnalysisRecord(file_record=fr, extraction=er, naming=nr, legal_metadata={}))
+                    
+                with _session_lock:
+                    _session.records = records
+                    _session.all_analysis_records = all_analysis_records
+                print(f"[session] Restored {len(records)} records from {review_path}")
+            except Exception as e:
+                print(f"[session] Failed to reload records from review file: {e}")
+    except Exception as exc:
+        print(f"[session] Failed to load session state: {exc}")
 
 
 # ── Rename session ────────────────────────────────────────────────────
@@ -286,7 +412,9 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
             start_time=_time.monotonic(),
             site_url=site_url,
             root_folder=root_folder,
+            folder_sharing_url=folder_sharing_url,
         )
+    _save_session_state()
 
     _broadcast({"type": "scanning", "message": "파일 목록 조회 중..."})
 
@@ -325,6 +453,7 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
         with _session_lock:
             _session.status = "running"
             _session.total = total
+        _save_session_state()
 
         _broadcast({"type": "start", "total": total, "folder_paths": folder_paths or []})
 
@@ -496,6 +625,7 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
             elapsed = _time.monotonic() - _session.start_time
             with _session_lock:
                 _session.status = "cancelled"
+            _save_session_state()
             _broadcast({
                 "type": "cancelled",
                 "processed": _session.processed,
@@ -530,6 +660,7 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
         elapsed = _time.monotonic() - _session.start_time
         with _session_lock:
             _session.status = "complete"
+        _save_session_state()
 
         _broadcast({
             "type": "complete",
@@ -575,6 +706,7 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
         with _session_lock:
             _session.status = "error"
             _session.last_error = str(exc)
+        _save_session_state()
         _broadcast({"type": "error", "message": str(exc)})
 
 
@@ -584,13 +716,21 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
 async def lifespan(app: FastAPI):
     global _main_loop
     _main_loop = asyncio.get_event_loop()
+    
+    # Load session state first
+    _load_session_state()
+    
     sp_cfg = _config.get("sharepoint", {})
-    default_url    = sp_cfg.get("site_url", "")
-    default_folder = sp_cfg.get("root_folder", "")
-    if default_url:
+    site_url = _session.site_url or sp_cfg.get("site_url", "")
+    root_folder = _session.root_folder or sp_cfg.get("root_folder", "")
+    folder_sharing_url = _session.folder_sharing_url or sp_cfg.get("folder_sharing_url", "")
+    
+    if site_url or folder_sharing_url:
         try:
-            await _main_loop.run_in_executor(None, lambda: _make_sp_client(default_url, default_folder))
-            print("[server] SharePoint 인증 완료 (토큰 캐시 활성)")
+            await _main_loop.run_in_executor(
+                None, lambda: _make_sp_client(site_url, root_folder, folder_sharing_url)
+            )
+            print(f"[server] SharePoint 인증 완료 (토큰 캐시 활성): url={site_url}, sharing_url={folder_sharing_url}")
         except Exception as exc:
             print(f"[server] 사전 인증 실패 (첫 조회 시 재시도): {exc}")
     yield
@@ -888,6 +1028,19 @@ async def analyze_stop():
         return {"status": _session.status}
 
 
+@app.post("/api/analyze/reset")
+async def analyze_reset():
+    global _session
+    with _session_lock:
+        if _session.status in ("scanning", "running"):
+            return {"error": "분석이 진행 중입니다. 먼저 중단하세요."}, 409
+        _session = AnalysisSession()
+    if SESSION_STATE_PATH.exists():
+        SESSION_STATE_PATH.unlink(missing_ok=True)
+    _broadcast({"type": "reset"})
+    return {"status": "ok"}
+
+
 @app.get("/api/analyze/stream")
 async def analyze_stream():
     q: asyncio.Queue = asyncio.Queue(maxsize=500)
@@ -942,6 +1095,9 @@ async def analyze_results():
             "errors": _session.errors,
             "review_path": _session.review_path,
             "records": list(_session.records),
+            "site_url": _session.site_url,
+            "root_folder": _session.root_folder,
+            "folder_sharing_url": _session.folder_sharing_url,
         }
 
 
@@ -975,6 +1131,9 @@ async def analyze_status():
             "manual_review": _session.manual_review,
             "errors": _session.errors,
             "elapsed": round(elapsed, 1),
+            "site_url": _session.site_url,
+            "root_folder": _session.root_folder,
+            "folder_sharing_url": _session.folder_sharing_url,
         }
 
 
@@ -984,6 +1143,7 @@ class RenameItem(BaseModel):
     original_full_path: str
     suggested_full_path: str
     sharepoint_item_id: str = ""
+    sharepoint_web_url: str = ""
     manually_edited: bool = False
 
 
@@ -1012,13 +1172,19 @@ async def rename_files(req: RenameRequest):
         _rename_session.result_csv = ""
         _rename_session.rollback_file = ""
 
-    sp_client = _get_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
-    if sp_client is None and req.site_url:
-        sp_client = _make_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
+    has_sp_items = any(bool(it.sharepoint_item_id) for it in req.items)
+    need_sp = has_sp_items or bool(req.site_url) or bool(req.folder_sharing_url)
+
+    sp_client = None
+    if need_sp:
+        sp_client = _get_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
+        if sp_client is None:
+            sp_client = _make_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
 
     review_rows = [
         {"approval": "Y", "original_full_path": it.original_full_path,
-         "suggested_full_path": it.suggested_full_path, "sharepoint_item_id": it.sharepoint_item_id}
+         "suggested_full_path": it.suggested_full_path, "sharepoint_item_id": it.sharepoint_item_id,
+         "sharepoint_web_url": it.sharepoint_web_url}
         for it in req.items
     ]
 
@@ -1083,6 +1249,7 @@ async def rename_files(req: RenameRequest):
                         old = Path(review_path)
                         with _session_lock:
                             _session.review_path = str(new_wb)
+                        _save_session_state()
                         if old.exists() and old != new_wb:
                             old.unlink(missing_ok=True)
                     except Exception as exc:
@@ -1226,11 +1393,8 @@ async def rollback_files(req: RollbackRequest):
     sp_client = _get_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
     if sp_client is None:
         cfg = _config.get("sharepoint", {})
-        _url = req.site_url or cfg.get("site_url", "")
-        _folder = req.root_folder or cfg.get("root_folder", "")
-        _fsu = req.folder_sharing_url or cfg.get("folder_sharing_url", "")
-        if _url:
-            sp_client = _make_sp_client(_url, _folder, _fsu)
+        if req.site_url or req.folder_sharing_url or cfg.get("site_url") or cfg.get("folder_sharing_url"):
+            sp_client = _make_sp_client(req.site_url, req.root_folder, req.folder_sharing_url)
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None, lambda: execute_rollback(

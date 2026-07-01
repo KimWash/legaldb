@@ -62,10 +62,12 @@ try:
                 break
                 
         if matched_device == "CPU":
-            cpu_nums = os.cpu_count()
+            cpu_nums = os.cpu_count() or 4
             infer_num_threads = config.get("inference_num_threads", -1)
-            if infer_num_threads != -1 and 1 <= infer_num_threads <= cpu_nums:
-                core.set_property("CPU", {"INFERENCE_NUM_THREADS": str(infer_num_threads)})
+            if infer_num_threads == -1:
+                infer_num_threads = max(1, cpu_nums // 4)
+            core.set_property("CPU", {"INFERENCE_NUM_THREADS": str(infer_num_threads)})
+            core.set_property("CPU", {"PERFORMANCE_HINT": "THROUGHPUT"})
                 
         compile_model = core.compile_model(model=model_onnx, device_name=matched_device)
         self.session = compile_model.create_infer_request()

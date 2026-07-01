@@ -433,6 +433,12 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
             else:
                 scanned = scan_sharepoint_files(sp_client, _config)
                 print(f"[scan] SharePoint 전체 스캔: {len(scanned)}개 파일")
+            
+            # 대용량 SharePoint 현황조회 캐시 객체 조기 해제 및 가비지 컬렉션 수행
+            _survey_cache = None
+            _file_index = None
+            import gc
+            gc.collect()
         else:
             scanned = scan_files(Path(_config["input_root"]), _config)
 
@@ -487,10 +493,14 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
             cached = cache_entries.get(ck)
             if isinstance(cached, dict) and isinstance(cached.get("extraction"), dict):
                 try:
+                    from main import is_rename_scope
+                    if cached["extraction"].get("extraction_status") == "skipped_out_of_scope" and is_rename_scope(record):
+                        raise ValueError("Re-analyze since it is now in scope")
                     from models import ExtractionResult
                     from main import _build_analysis_result
                     ext = ExtractionResult(**cached["extraction"])
                     ar  = _build_analysis_result(record, ext, cached.get("llm_result"), runtime_cfg)
+                    ar.extraction.extracted_text = ""  # Free heavy text data immediately
                     all_records.append(ar)
                     rec = _record_to_dict(ar)
                     with _session_lock:
@@ -552,6 +562,7 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
                     record = futures[future]
                     try:
                         ar, ck, payload = future.result()
+                        ar.extraction.extracted_text = ""  # Free heavy text data immediately
                         cache_entries[ck] = payload
                         all_records.append(ar)
                         rec_dict = _record_to_dict(ar)
@@ -586,6 +597,10 @@ def _run_analysis(site_url: str, root_folder: str, max_files: int, fast: bool,
 
                     # Explicitly clean up completed future references
                     del futures[future]
+
+                    # Periodic cache auto-save (every 50 records) to prevent loss on crash
+                    if _session.processed % 50 == 0:
+                        _save_cache(cache_path, {"schema_version": CACHE_SCHEMA_VERSION, "entries": cache_entries})
 
                     elapsed = _time.monotonic() - _session.start_time
                     _broadcast({

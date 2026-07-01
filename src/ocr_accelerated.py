@@ -12,6 +12,50 @@ Public API mirrors ocr_advanced so extractors can swap backends:
 """
 
 from dataclasses import asdict
+import os
+import sys
+
+# OpenVINO 2026.x에서 openvino.runtime이 제거됨에 따른 하위 호환성 패치 (Mocking) 및 메모리 누수/디바이스 최적화
+try:
+    import openvino
+    sys.modules["openvino.runtime"] = openvino
+    
+    # Core.compile_model을 몽키패치하여 CPU 메모리 누수를 방지하고 GPU 강제 실행 처리
+    _orig_compile_model = openvino.Core.compile_model
+    
+    def _patched_compile_model(self, model, device_name=None, config=None, *args, **kwargs):
+        if config is None:
+            config = {}
+        else:
+            config = dict(config)
+            
+        try:
+            available = self.available_devices
+        except Exception:
+            available = ["CPU"]
+            
+        # rapidocr-openvino의 CPU 하드코딩 우회 및 GPU 가속 강제 적용
+        if device_name == "CPU" and "GPU" in available:
+            device_name = "GPU"
+            
+        if device_name == "CPU":
+            # CPU 구동 시 dynamic shapes로 인한 메모리 증식(캐시 리크) 방지
+            config["CPU_RUNTIME_CACHE_CAPACITY"] = "0"
+            
+        return _orig_compile_model(self, model, device_name, config, *args, **kwargs)
+        
+    openvino.Core.compile_model = _patched_compile_model
+except ImportError:
+    pass
+
+# Intel OpenVINO 가속 백엔드 CPU 스레드 과다 생성 방지 (컨텐션 완화)
+if "OV_CPU_NUM_THREADS" not in os.environ:
+    os.environ["OV_CPU_NUM_THREADS"] = "4"
+if "OPENVINO_NUM_THREADS" not in os.environ:
+    os.environ["OPENVINO_NUM_THREADS"] = "4"
+if "OMP_NUM_THREADS" not in os.environ:
+    os.environ["OMP_NUM_THREADS"] = "4"
+
 from pathlib import Path
 import hashlib
 import json

@@ -235,12 +235,12 @@ def _should_call_llm(record, extraction: ExtractionResult, use_llm: bool) -> boo
 
 
 def _build_analysis_result(record, extraction: ExtractionResult, llm_result: dict | None, config: dict, llm_client=None) -> AnalysisRecord:
-    # 범위 밖('4. 기타문서' 아님) 파일은 (지원 여부와 무관하게) 원본명 유지 — 캐시 적중/신규 경로 동일 처리
+    # 범위 밖('4. 기타문서' 포함) 파일은 (지원 여부와 무관하게) 원본명 유지 — 캐시 적중/신규 경로 동일 처리
     if not is_rename_scope(record):
         naming = NamingResult(
             suggested_file_name=record.original_file_name,
             suggested_full_path=record.original_full_path,
-            reason="개명 대상 폴더('4. 기타문서')가 아니어서 원본 파일명을 유지합니다.",
+            reason="개명 제외 대상 폴더('4. 기타문서')에 속하여 원본 파일명을 유지합니다.",
             confidence=0.0,
             needs_manual_review=False,
             rename_status="out_of_scope",
@@ -371,12 +371,12 @@ def _analyze_single_record_inner(
     sp_client: SharePointClient | None = None,
     sp_semaphore: BoundedSemaphore | None = None,
 ) -> tuple[AnalysisRecord, str, dict]:
-    # 개명 대상은 경로에 '4. 기타문서'가 있는 파일뿐. 범위 밖이면 (지원 여부 무관) OCR/LLM 생략·원본명 유지.
+    # 개명 대상은 경로에 '4. 기타문서'가 없는 파일뿐. 범위 밖이면 (지원 여부 무관) OCR/LLM 생략·원본명 유지.
     if not is_rename_scope(record):
         extraction = ExtractionResult(
             file_type=record.file_extension.lstrip(".") or "file",
             extraction_status="skipped_out_of_scope",
-            notes=["'4. 기타문서' 경로가 아니어서 개명 대상에서 제외 (OCR/LLM 생략)."],
+            notes=["개명 제외 대상 폴더('4. 기타문서')에 속하여 개명 대상에서 제외 (OCR/LLM 생략)."],
         )
         analysis = _build_analysis_result(record, extraction, None, config)
         cache_payload = {"extraction": asdict(extraction), "llm_result": None}
@@ -516,9 +516,12 @@ def analyze(
         cached = cache_entries.get(cache_key) if cache_enabled else None
         if isinstance(cached, dict) and isinstance(cached.get("extraction"), dict):
             try:
+                if cached["extraction"].get("extraction_status") == "skipped_out_of_scope" and is_rename_scope(record):
+                    raise ValueError("Re-analyze since it is now in scope")
                 extraction = ExtractionResult(**cached["extraction"])
                 llm_result = cached.get("llm_result")
                 result = _build_analysis_result(record, extraction, llm_result, runtime_config)
+                result.extraction.extracted_text = ""  # Free heavy text data immediately
                 analysis_records.append(result)
                 processed_count += 1
                 cache_hit_count += 1
@@ -585,6 +588,7 @@ def analyze(
                 record = future_to_record[future]
                 try:
                     result, cache_key, cache_payload = future.result()
+                    result.extraction.extracted_text = ""  # Free heavy text data immediately
                     if cache_enabled:
                         cache_entries[cache_key] = cache_payload
                 except Exception as exc:

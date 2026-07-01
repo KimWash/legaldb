@@ -25,3 +25,8 @@ memory/
 # OS
 .DS_Store
 Thumbs.db
+
+# Scratch and error logs
+scratch/
+kernel.errors.txt
+

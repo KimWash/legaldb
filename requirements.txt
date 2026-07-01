@@ -1,4 +1,4 @@
-msal>=1.28.0
+﻿msal>=1.28.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 selenium>=4.20.0

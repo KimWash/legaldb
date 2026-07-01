@@ -53,7 +53,7 @@ def _get_pdf_page_count(pdf_path: Path) -> int:
             pass
 
 
-def _iter_pdf_pages(pdf_path: Path, dpi: int) -> Iterator[tuple[int, object]]:
+def _iter_pdf_pages(pdf_path: Path, dpi: int, max_dim_limit: int = 0) -> Iterator[tuple[int, object]]:
     """Lazily yield (page_no, bgr_image) one page at a time to avoid loading all pages into memory.
 
     doc.close() is guaranteed via try/finally even when the caller breaks early or
@@ -64,11 +64,23 @@ def _iter_pdf_pages(pdf_path: Path, dpi: int) -> Iterator[tuple[int, object]]:
     import cv2
     import numpy as np
 
-    scale = dpi / 72.0
     doc = pdfium.PdfDocument(str(pdf_path))
     try:
         for page_index in range(len(doc)):
             page = doc[page_index]
+            
+            # Adaptive scale calculation: render at target max dimension directly
+            if max_dim_limit > 0:
+                orig_w, orig_h = page.get_size()
+                orig_max = max(orig_w, orig_h)
+                default_pixel_max = orig_max * (dpi / 72.0)
+                if default_pixel_max > max_dim_limit:
+                    scale = max_dim_limit / orig_max
+                else:
+                    scale = dpi / 72.0
+            else:
+                scale = dpi / 72.0
+                
             render_pil = page.render(scale=scale).to_pil()
             pil_img = render_pil.convert("RGB")
             rgb = np.array(pil_img)
@@ -90,6 +102,38 @@ def _iter_pdf_pages(pdf_path: Path, dpi: int) -> Iterator[tuple[int, object]]:
             doc.close()
         except Exception:
             pass
+
+
+def _iter_pdf_pages_queued(
+    pdf_path: Path,
+    dpi: int,
+    max_dim_limit: int = 0,
+    queue_size: int = 4
+) -> Iterator[tuple[int, object]]:
+    """Runs PDF rendering in a background thread using a Queue to overlap with OCR inference."""
+    import queue
+    import threading
+
+    q = queue.Queue(maxsize=queue_size)
+
+    def producer():
+        try:
+            for page_no, image in _iter_pdf_pages(pdf_path, dpi=dpi, max_dim_limit=max_dim_limit):
+                q.put((page_no, image))
+            q.put((None, None))  # Sentinel for EOF
+        except Exception as exc:
+            q.put((None, exc))
+
+    t = threading.Thread(target=producer, daemon=True)
+    t.start()
+
+    while True:
+        page_no, item = q.get()
+        if page_no is None:
+            if isinstance(item, Exception):
+                raise item
+            break
+        yield page_no, item
 
 
 def _preprocess_image(image):
@@ -235,7 +279,7 @@ def run_advanced_ocr(pdf_path: Path, temp_dir: Path, config: dict, timeout_secon
     timed_out = False
     start_time = time.monotonic()
 
-    for page_no, image in _iter_pdf_pages(pdf_path, dpi=dpi):
+    for page_no, image in _iter_pdf_pages_queued(pdf_path, dpi=dpi):
         if timeout_seconds > 0 and time.monotonic() - start_time > timeout_seconds:
             timed_out = True
             break

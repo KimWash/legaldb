@@ -11,9 +11,7 @@ import time
 import warnings
 
 from models import ExtractionResult
-from ocr_advanced import run_advanced_ocr
 from ocr_accelerated import run_accelerated_ocr
-from ocr_runner import run_ocrmypdf
 
 # Suppress pypdf warnings and logger warnings for advanced encodings
 warnings.filterwarnings("ignore", message=".*Advanced encoding.*")
@@ -204,26 +202,8 @@ def extract_pdf(path: Path, config: dict, temp_dir: Path, max_chars: int = 8000)
                 notes=["OCR disabled and PDF text was insufficient."],
             )
 
-        # 1순위: Intel 가속(OpenVINO/RapidOCR). 미가용/실패 시 Tesseract(advanced)→ocrmypdf 폴백.
-        if engine == "accelerated":
-            accel_result = _extract_with_accelerated_ocr(path, config=config, temp_dir=temp_dir, max_chars=max_chars)
-            if accel_result.extraction_status == "success":
-                return accel_result
-            accel_status = accel_result.extraction_status
-
-        if advanced_enabled:
-            advanced_result = _extract_with_advanced_ocr(path, config=config, temp_dir=temp_dir, max_chars=max_chars)
-            if engine == "accelerated":
-                advanced_result.notes.append(f"Accelerated OCR fell back: {accel_status}")
-            if advanced_result.extraction_status == "success":
-                return advanced_result
-            if fallback_to_ocrmypdf:
-                fallback = _extract_with_ocrmypdf(path, config=config, temp_dir=temp_dir, max_chars=max_chars, page_count_hint=page_count)
-                fallback.notes.append(f"Advanced OCR failed first: {advanced_result.extraction_status}")
-                return fallback
-            return advanced_result
-
-        return _extract_with_ocrmypdf(path, config=config, temp_dir=temp_dir, max_chars=max_chars, page_count_hint=page_count)
+        # 무조건 Intel 가속(OpenVINO/RapidOCR) 엔진 사용. GPU/NPU 미가용 시 CPU로 자동 폴백됨.
+        return _extract_with_accelerated_ocr(path, config=config, temp_dir=temp_dir, max_chars=max_chars)
 
     except ModuleNotFoundError as exc:
         return ExtractionResult(file_type="pdf", extraction_status=f"missing_dependency:{exc}", notes=["Required PDF/OCR dependency is not installed."])
